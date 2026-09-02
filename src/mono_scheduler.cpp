@@ -8,6 +8,8 @@
  */
 #include "mono_scheduler.h"
 #include "mono_hook.h"
+#include "mono_runtime.h"
+#include "mono_resolver.h"
 #include "lua_engine.h"
 
 extern "C" {
@@ -40,6 +42,29 @@ bool MonoScheduler::SetTick(MonoMethod* method, std::string& error)
     std::lock_guard<std::mutex> lock(g_mutex);
     g_tick = method; g_mainThread = 0; g_ready = false;
     return true;
+}
+
+bool MonoScheduler::AutoSetTick(std::string& error)
+{
+    error.clear();
+    MonoClass* time = MonoRuntime::Instance().FindClass("UnityEngine", "Time");
+    if (!time) { error = "UnityEngine.Time was not found"; return false; }
+    static constexpr const char* names[] = {
+        "get_frameCount", "get_deltaTime", "get_unscaledDeltaTime",
+        "get_time", "get_unscaledTime", "get_realtimeSinceStartup"
+    };
+    auto& resolver = MonoResolver::Instance();
+    for (const char* name : names)
+        for (MonoMethod* method : resolver.EnumerateMethods(time))
+        {
+            const char* methodName = resolver.MethodName(method);
+            if (!methodName || strcmp(methodName, name) != 0 ||
+                (resolver.MethodFlags(method) & 0x0010) == 0 ||
+                !resolver.MethodParameters(method).empty()) continue;
+            if (SetTick(method, error)) return true;
+        }
+    if (error.empty()) error = "no usable UnityEngine.Time tick method was found";
+    return false;
 }
 
 MonoMethod* MonoScheduler::GetTick()

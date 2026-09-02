@@ -351,11 +351,9 @@ bool MonoHook::HookMethod(lua_State* state, MonoMethod* method, int callbackInde
         error = "hooking methods declared by value types is not supported";
         return false;
     }
-    if (!resolver.CanInspectGenericMethods())
-    {
-        error = "this Mono runtime cannot verify generic method Hook safety";
-        return false;
-    }
+    // 老版本 Mono 没有 mono_method_is_generic/inflated。MethodIsGeneric()
+    // 在缺失这些可选导出时保守返回 false；不能因此让所有普通方法 Hook
+    // 都不可用。真正无法安全识别的泛型方法仍由签名检查拒绝。
     if (resolver.MethodIsGeneric(method))
     {
         error = "hooking generic or inflated methods is not supported";

@@ -18,6 +18,7 @@ namespace MonoScheduler
 {
     bool Schedule(lua_State* state, int callbackIndex);
     bool SetTick(MonoMethod* method, std::string& error);
+    bool AutoSetTick(std::string& error);
     MonoMethod* GetTick();
     bool IsReady();
     bool IsMainThread();

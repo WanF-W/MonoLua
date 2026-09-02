@@ -79,7 +79,12 @@ int LuaBridge_ContainerLength(lua_State* state, MonoObject* object)
 int LuaBridge_ContainerIndex(lua_State* state, MonoObject* object, lua_Integer index)
 {
     const int length = LuaBridge_ContainerLength(state, object);
-    if (index < 1 || index > length) return luaL_error(state, "container index out of range: %lld", static_cast<long long>(index));
+    if (index < 1 || index > length)
+    {
+        char message[96];
+        sprintf_s(message, "container index out of range: %lld", static_cast<long long>(index));
+        return luaL_error(state, "%s", message);
+    }
     if (LuaBridge_IsArray(object))
     {
         auto& resolver = MonoResolver::Instance();
@@ -106,7 +111,12 @@ int LuaBridge_ContainerNewIndex(
     lua_State* state, MonoObject* object, lua_Integer index, int valueIndex)
 {
     const int length = LuaBridge_ContainerLength(state, object);
-    if (index < 1 || index > length) return luaL_error(state, "container index out of range: %lld", static_cast<long long>(index));
+    if (index < 1 || index > length)
+    {
+        char message[96];
+        sprintf_s(message, "container index out of range: %lld", static_cast<long long>(index));
+        return luaL_error(state, "%s", message);
+    }
     if (LuaBridge_IsArray(object))
     {
         auto& resolver = MonoResolver::Instance();

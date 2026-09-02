@@ -78,6 +78,15 @@ namespace
         return 1;
     }
 
+    int Mono_GetMissingExports(lua_State* state)
+    {
+        const auto missing = MonoResolver::Instance().MissingOptionalExports();
+        lua_createtable(state, static_cast<int>(missing.size()), 0);
+        for (size_t i = 0; i < missing.size(); ++i)
+            lua_pushstring(state, missing[i].c_str()), lua_rawseti(state, -2, static_cast<lua_Integer>(i + 1));
+        return 1;
+    }
+
     int Mono_IsInitialized(lua_State* state)
     {
         lua_pushboolean(state, MonoRuntime::Instance().IsInitialized());
@@ -198,6 +207,7 @@ void LuaBinding_RegisterGlobals(lua_State* state)
 
     static const luaL_Reg monoFunctions[] = {
         {"get_status", Mono_GetStatus},
+        {"get_missing_exports", Mono_GetMissingExports},
         {"is_initialized", Mono_IsInitialized},
         {"get_assemblies", Mono_GetAssemblies},
         {"get_assembly", Mono_GetAssembly},

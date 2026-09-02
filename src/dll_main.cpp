@@ -67,6 +67,8 @@ static void WorkerMain()
 
     // READY 只表达启动链已经完成。详细的导出解析、程序集数量、Root
     // Domain 和模块基址由 mono.get_status() 按需查询，避免每次启动刷屏。
+    std::string tickError;
+    MonoScheduler::AutoSetTick(tickError);
     pipe.SendReady("ready");
     // 命令在 DLL 工作线程串行执行。主线程调度器只负责投递任务，不会
     // 改变管道命令响应的一问一答关系。

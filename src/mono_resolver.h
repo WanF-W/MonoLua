@@ -30,6 +30,7 @@ public:
     MonoDomain* CurrentDomain() const;
     const std::wstring& ModuleName() const { return m_moduleName; }
     std::string ResolveStatus() const;
+    std::vector<std::string> MissingOptionalExports() const { return m_missingOptional; }
     const std::string& LastError() const { return m_lastError; }
 
     MonoThread* CurrentThread() const;

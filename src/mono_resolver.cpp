@@ -305,15 +305,6 @@ std::string MonoResolver::ResolveStatus() const
 {
     std::ostringstream output;
     output << m_resolvedCount << '/' << m_exportCount << " exports resolved";
-    if (!m_missingOptional.empty())
-    {
-        output << ", optional missing: ";
-        for (size_t index = 0; index < m_missingOptional.size(); ++index)
-        {
-            if (index != 0) output << ", ";
-            output << m_missingOptional[index];
-        }
-    }
     return output.str();
 }
 
