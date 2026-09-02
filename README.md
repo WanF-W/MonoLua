@@ -16,12 +16,45 @@
 - [API 模型](#api-model)
 - [API 参考](#api-reference)
   - [`lua`](#api-lua)
+    - [`lua.each`](#lua-each)
+    - [`lua.dump`](#lua-dump)
+    - [`lua.hex`](#lua-hex)
   - [`mono`](#api-mono)
+    - [`mono.get_status`](#mono-get-status)
+    - [`mono.get_assemblies`](#mono-get-assemblies)
+    - [`mono.get_class`](#mono-get-class)
+    - [`mono.wrap`](#mono-wrap)
+    - [`mono.unhook_all`](#mono-unhook-all)
+    - [`mono.schedule`](#mono-schedule)
+    - [`mono.set_tick`](#mono-set-tick)
   - [`Assembly`](#api-assembly)
+    - [`assembly:get_name`](#assembly-get-name)
+    - [`assembly:get_class`](#assembly-get-class)
+    - [`assembly:get_classes`](#assembly-get-classes)
   - [`Class`](#api-class)
+    - [类型信息](#class-information)
+    - [`class:get_method`](#class-get-method)
+    - [`class:get_field`](#class-get-field)
+    - [`class:new`](#class-new)
+    - [`class:new_array`](#class-new-array)
+    - [`class:static_call`](#class-static-call)
+    - [`class:read_static_field` / `write_static_field`](#class-static-field)
+    - [`class:find_unity_objects`](#class-find-unity-objects)
   - [`Instance`](#api-instance)
+    - [`instance:call`](#instance-call)
+    - [`instance:read_field` / `write_field`](#instance-field)
+    - [`instance:get_class` / `get_address`](#instance-information)
+    - [`#obj` / `obj[index]`](#instance-container-syntax)
+    - [`instance:each`](#instance-container-syntax)
+    - [`instance:dump`](#instance-dump)
   - [`Method`](#api-method)
+    - [方法信息](#method-information)
+    - [`method:call`](#method-call)
+    - [`method:hook`](#method-hook)
+    - [`method:is_hooked` / `unhook`](#method-hook-state)
   - [`Field`](#api-field)
+    - [字段信息](#field-information)
+    - [`field:read` / `field:write`](#field-read-write)
 - [Lua 与 Mono 类型映射](#type-mapping)
 - [Hook 与线程模型](#hook-threading)
 - [通信与版本校验](#protocol-version)
@@ -113,7 +146,11 @@ end
 
 ## 📚 API 参考
 
+<a id="api-lua"></a>
+
 ### 🧰 `lua`：Lua table 工具
+
+<a id="lua-each"></a>
 
 #### `lua.each(table, callback)`
 
@@ -129,6 +166,8 @@ lua.each({ hp = 100, mp = 50 }, function(value, key)
 end)
 ```
 
+<a id="lua-dump"></a>
+
 #### `lua.dump(table)`
 
 输出 table 的第一层键值，不递归展开嵌套对象。
@@ -136,6 +175,8 @@ end)
 ```lua
 lua.dump({ name = "Player", stats = { hp = 100 } })
 ```
+
+<a id="lua-hex"></a>
 
 #### `lua.hex(value)`
 
@@ -147,6 +188,8 @@ print(lua.hex(24))
 print(lua.hex(instance:get_address()))
 print(lua.hex(field:get_offset()))
 ```
+
+<a id="api-mono"></a>
 
 <a id="api-mono"></a>
 
@@ -166,6 +209,8 @@ print(lua.hex(field:get_offset()))
 | `mono.get_tick()` | 获取当前 tick 方法 |
 | `mono.is_tick_ready()` | 判断 tick Hook 是否就绪 |
 
+<a id="mono-get-status"></a>
+
 #### `mono.get_status()` / `mono.is_initialized()`
 
 获取运行时状态，或判断 Mono 是否已经初始化完成。
@@ -174,6 +219,8 @@ print(lua.hex(field:get_offset()))
 print(mono.get_status())
 assert(mono.is_initialized(), "Mono runtime is not ready")
 ```
+
+<a id="mono-get-assemblies"></a>
 
 #### `mono.get_assemblies()` / `mono.get_assembly(name)`
 
@@ -189,6 +236,8 @@ local core = mono.get_assembly("mscorlib.dll")
 print(game, core)
 ```
 
+<a id="mono-get-class"></a>
+
 #### `mono.get_class(namespace, name)`
 
 遍历全部已加载程序集查找类型。存在同名类型时，应使用
@@ -199,6 +248,8 @@ local player = mono.get_class("Game", "Player")
 local global = mono.get_class("", "GlobalManager")
 print(player, global)
 ```
+
+<a id="mono-wrap"></a>
 
 #### `mono.wrap(address)`
 
@@ -213,6 +264,8 @@ else
 end
 ```
 
+<a id="mono-unhook-all"></a>
+
 #### `mono.unhook_all()`
 
 移除全部用户方法 Hook；内部主线程 tick Hook 不属于用户 Hook。
@@ -220,6 +273,8 @@ end
 ```lua
 mono.unhook_all()
 ```
+
+<a id="mono-schedule"></a>
 
 #### `mono.schedule(callback)`
 
@@ -231,6 +286,8 @@ mono.schedule(function()
     print(time:static_call("get_frameCount"))
 end)
 ```
+
+<a id="mono-set-tick"></a>
 
 #### `mono.set_tick(method)` / `mono.get_tick()` / `mono.is_tick_ready()`
 
@@ -247,7 +304,11 @@ print(mono.is_tick_ready())
 
 <a id="api-assembly"></a>
 
+<a id="api-assembly"></a>
+
 ### 📦 `Assembly`：程序集
+
+<a id="assembly-get-name"></a>
 
 #### `assembly:get_name()`
 
@@ -258,6 +319,8 @@ local assembly = mono.get_assembly("Assembly-CSharp")
 print(assembly:get_name())
 ```
 
+<a id="assembly-get-class"></a>
+
 #### `assembly:get_class(namespace, name)`
 
 只在当前程序集内查找类型，不回退到全程序集搜索。
@@ -267,6 +330,8 @@ local game = mono.get_assembly("Assembly-CSharp")
 local player = game:get_class("Game", "Player")
 local global = game:get_class("", "GlobalManager")
 ```
+
+<a id="assembly-get-classes"></a>
 
 #### `assembly:get_classes()`
 
@@ -280,6 +345,8 @@ end)
 
 <a id="api-class"></a>
 
+<a id="api-class"></a>
+
 ### 🧬 `Class`：类型
 
 类型信息接口包括 `get_name`、`get_namespace`、`get_full_name`、`get_assembly`、
@@ -289,6 +356,8 @@ end)
 `new_array`、`static_call`、`read_static_field`、`write_static_field`、
 `find_unity_objects` 和 `dump`。`get_method(name, parameterType...)` 支持按完整参数
 类型选择重载，类型别名包括 `bool`、`int`、`float`、`double`、`string`、`object` 等。
+
+<a id="class-information"></a>
 
 #### 类型信息
 
@@ -304,6 +373,8 @@ print(cls:get_instance_size())
 print(lua.hex(cls:get_address()))
 ```
 
+<a id="class-get-method"></a>
+
 #### `class:get_method(name [, parameterType...])` / `class:get_methods()`
 
 不传参数类型时返回第一个同名方法；传入参数类型时精确选择重载。
@@ -318,6 +389,8 @@ lua.each(cls:get_methods(), function(method)
 end)
 ```
 
+<a id="class-get-field"></a>
+
 #### `class:get_field(name)` / `class:get_fields()`
 
 查找或枚举当前类声明的字段。
@@ -331,6 +404,8 @@ lua.each(cls:get_fields(), function(field)
 end)
 ```
 
+<a id="class-new"></a>
+
 #### `class:new(...)` / `class:alloc()`
 
 `new` 分配对象并调用匹配的构造函数；`alloc` 只分配对象，不调用构造函数。
@@ -341,6 +416,8 @@ local named = cls:new("Wukong")
 local raw = cls:alloc()
 raw:write_field("health", 100)
 ```
+
+<a id="class-new-array"></a>
 
 #### `class:new_array(length)`
 
@@ -356,6 +433,8 @@ players[1] = cls:new()
 players[2] = nil
 ```
 
+<a id="class-static-call"></a>
+
 #### `class:static_call(name, ...)`
 
 按 Lua 实参自动选择并调用静态方法重载。
@@ -366,6 +445,8 @@ print(manager:static_call("GetCurrent"))
 manager:static_call("SetDifficulty", 2)
 ```
 
+<a id="class-static-field"></a>
+
 #### `class:read_static_field(name)` / `class:write_static_field(name, value)`
 
 读写静态字段；实例字段必须使用 Instance 接口。
@@ -375,6 +456,8 @@ local manager = mono.get_class("Game", "PlayerManager")
 print(manager:read_static_field("Instance"))
 manager:write_static_field("DebugEnabled", true)
 ```
+
+<a id="class-find-unity-objects"></a>
 
 #### `class:find_unity_objects()` / `class:dump()`
 
@@ -393,11 +476,15 @@ enemy:dump()
 
 <a id="api-instance"></a>
 
+<a id="api-instance"></a>
+
 ### 🎮 `Instance`：托管对象与容器
 
 支持 `call`、`read_field`、`write_field`、`get_class`、`get_address`、`dump` 和 `each`。
 数组与 `List<T>` 使用 Lua 1 基索引：`#obj` 获取长度，`obj[index]` 读写元素；普通
 对象不支持长度运算和数字下标。
+
+<a id="instance-call"></a>
 
 #### `instance:call(name, ...)`
 
@@ -410,6 +497,8 @@ print(player:call("GetLevel"))
 player:call("Teleport", 10.0, 20.0, 30.0)
 ```
 
+<a id="instance-field"></a>
+
 #### `instance:read_field(name)` / `instance:write_field(name, value)`
 
 读写实例字段；静态字段使用 Class 接口。
@@ -420,6 +509,8 @@ player:write_field("health", 999)
 player:write_field("target", nil)
 ```
 
+<a id="instance-information"></a>
+
 #### `instance:get_class()` / `instance:get_address()`
 
 获取实际类型和对象地址。
@@ -428,6 +519,8 @@ player:write_field("target", nil)
 print(player:get_class():get_full_name())
 print(lua.hex(player:get_address()))
 ```
+
+<a id="instance-container-syntax"></a>
 
 #### `#instance`、`instance[index]`、`instance[index] = value`、`instance:each(callback)`
 
@@ -443,6 +536,8 @@ inventory:each(function(item, index)
 end)
 ```
 
+<a id="instance-dump"></a>
+
 #### `instance:dump([includeParents])`
 
 普通对象默认输出自身字段；传入 `true` 时同时输出父类字段。数组和 List 会直接输出逻辑元素。
@@ -455,11 +550,15 @@ inventory:dump()
 
 <a id="api-method"></a>
 
+<a id="api-method"></a>
+
 ### 🔧 `Method`：精确方法
 
 支持 `get_name`、`get_class`、`get_signature`、`get_address`、`call`、`hook`、
 `is_hooked` 和 `unhook`。实例 Hook 回调为 `function(this, original, ...)`；静态 Hook
 回调的第一个参数为声明该方法的 Class。
+
+<a id="method-information"></a>
 
 #### 方法信息
 
@@ -470,6 +569,8 @@ print(method:get_class():get_full_name())
 print(method:get_signature())
 print(lua.hex(method:get_address()))
 ```
+
+<a id="method-call"></a>
 
 #### `method:call(instance, ...)`
 
@@ -485,6 +586,8 @@ setLevel:call(player, 30)
 local getCurrent = mono.get_class("Game", "PlayerManager"):get_method("GetCurrent")
 print(getCurrent:call())
 ```
+
+<a id="method-hook"></a>
 
 #### `method:hook(callback)`
 
@@ -517,6 +620,8 @@ calculate:hook(function(declaringClass, original, value)
 end)
 ```
 
+<a id="method-hook-state"></a>
+
 #### `method:is_hooked()` / `method:unhook()`
 
 ```lua
@@ -527,10 +632,14 @@ end
 
 <a id="api-field"></a>
 
+<a id="api-field"></a>
+
 ### 🏷️ `Field`：精确字段
 
 支持 `get_name`、`get_class`、`get_signature`、`get_offset`、`read` 和 `write`。
 实例字段操作传入 Instance；静态字段不传 Instance。`const` 字段不可写。
+
+<a id="field-information"></a>
 
 #### 字段信息
 
@@ -543,6 +652,8 @@ print(lua.hex(field:get_offset()))
 ```
 
 静态字段没有实例偏移，`get_offset()` 返回 `nil`。
+
+<a id="field-read-write"></a>
 
 #### `field:read(instance)` / `field:write(instance, value)`
 
