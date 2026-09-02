@@ -1,0 +1,40 @@
+/**
+ * ============================================================
+ * version.rc — MonoLua.dll Windows 版本资源
+ * ============================================================
+ * 所有版本数字和字符串均引用 version.h，不在资源文件中重复硬编码。
+ * ============================================================
+ */
+#include <windows.h>
+#include "version.h"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION MONOLUA_VERSION_NUMERIC
+ PRODUCTVERSION MONOLUA_VERSION_NUMERIC
+ FILEFLAGSMASK 0x3fL
+#ifdef _DEBUG
+ FILEFLAGS VS_FF_DEBUG
+#else
+ FILEFLAGS 0x0L
+#endif
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_DLL
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "MonoLua"
+            VALUE "FileDescription", "MonoLua runtime bridge"
+            VALUE "FileVersion", MONOLUA_VERSION_STRING
+            VALUE "InternalName", "MonoLua.dll"
+            VALUE "OriginalFilename", "MonoLua.dll"
+            VALUE "ProductName", "MonoLua"
+            VALUE "ProductVersion", MONOLUA_VERSION_STRING
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END

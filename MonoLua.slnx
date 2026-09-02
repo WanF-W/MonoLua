@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="MonoLua.vcxproj" Id="70f61fbf-35ad-4c88-9d41-6b862f926bcc" />
+</Solution>
