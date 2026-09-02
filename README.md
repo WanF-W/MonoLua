@@ -16,45 +16,12 @@
 - [API 模型](#api-model)
 - [API 参考](#api-reference)
   - [`lua`](#api-lua)
-    - [`lua.each`](#lua-each)
-    - [`lua.dump`](#lua-dump)
-    - [`lua.hex`](#lua-hex)
   - [`mono`](#api-mono)
-    - [`mono.get_status`](#mono-get-status)
-    - [`mono.get_assemblies`](#mono-get-assemblies)
-    - [`mono.get_class`](#mono-get-class)
-    - [`mono.wrap`](#mono-wrap)
-    - [`mono.unhook_all`](#mono-unhook-all)
-    - [`mono.schedule`](#mono-schedule)
-    - [`mono.set_tick`](#mono-set-tick)
   - [`Assembly`](#api-assembly)
-    - [`assembly:get_name`](#assembly-get-name)
-    - [`assembly:get_class`](#assembly-get-class)
-    - [`assembly:get_classes`](#assembly-get-classes)
   - [`Class`](#api-class)
-    - [类型信息](#class-information)
-    - [`class:get_method`](#class-get-method)
-    - [`class:get_field`](#class-get-field)
-    - [`class:new`](#class-new)
-    - [`class:new_array`](#class-new-array)
-    - [`class:static_call`](#class-static-call)
-    - [`class:read_static_field` / `write_static_field`](#class-static-field)
-    - [`class:find_unity_objects`](#class-find-unity-objects)
   - [`Instance`](#api-instance)
-    - [`instance:call`](#instance-call)
-    - [`instance:read_field` / `write_field`](#instance-field)
-    - [`instance:get_class` / `get_address`](#instance-information)
-    - [`#obj` / `obj[index]`](#instance-container-syntax)
-    - [`instance:each`](#instance-container-syntax)
-    - [`instance:dump`](#instance-dump)
   - [`Method`](#api-method)
-    - [方法信息](#method-information)
-    - [`method:call`](#method-call)
-    - [`method:hook`](#method-hook)
-    - [`method:is_hooked` / `unhook`](#method-hook-state)
   - [`Field`](#api-field)
-    - [字段信息](#field-information)
-    - [`field:read` / `field:write`](#field-read-write)
 - [Lua 与 Mono 类型映射](#type-mapping)
 - [Hook 与线程模型](#hook-threading)
 - [通信与版本校验](#protocol-version)
@@ -150,6 +117,12 @@ end
 
 ### 🧰 `lua`：Lua table 工具
 
+| API | 作用 |
+| --- | --- |
+| [`lua.each`](#lua-each) | 遍历普通 Lua table |
+| [`lua.dump`](#lua-dump) | 输出 table 的第一层键值 |
+| [`lua.hex`](#lua-hex) | 格式化整数或地址 |
+
 <a id="lua-each"></a>
 
 #### `lua.each(table, callback)`
@@ -194,6 +167,20 @@ print(lua.hex(field:get_offset()))
 <a id="api-mono"></a>
 
 ### ⚙️ `mono`：运行时入口
+
+| API | 作用 |
+| --- | --- |
+| [`mono.get_status`](#mono-get-status) | 获取运行时和调度状态 |
+| [`mono.is_initialized`](#mono-get-status) | 判断运行时是否初始化完成 |
+| [`mono.get_assemblies`](#mono-get-assemblies) | 枚举全部程序集 |
+| [`mono.get_assembly`](#mono-get-assemblies) | 按名称查找程序集 |
+| [`mono.get_class`](#mono-get-class) | 跨程序集查找类型 |
+| [`mono.wrap`](#mono-wrap) | 包装裸 Mono 对象地址 |
+| [`mono.unhook_all`](#mono-unhook-all) | 禁用全部用户 Hook |
+| [`mono.schedule`](#mono-schedule) | 投递主线程任务 |
+| [`mono.set_tick`](#mono-set-tick) | 设置主线程 tick |
+| [`mono.get_tick`](#mono-set-tick) | 获取当前 tick |
+| [`mono.is_tick_ready`](#mono-set-tick) | 判断 tick 是否就绪 |
 
 | API | 作用 |
 | --- | --- |
@@ -308,6 +295,12 @@ print(mono.is_tick_ready())
 
 ### 📦 `Assembly`：程序集
 
+| API | 作用 |
+| --- | --- |
+| [`assembly:get_name`](#assembly-get-name) | 获取程序集名称 |
+| [`assembly:get_class`](#assembly-get-class) | 在当前程序集查找类型 |
+| [`assembly:get_classes`](#assembly-get-classes) | 枚举当前程序集的类型 |
+
 <a id="assembly-get-name"></a>
 
 #### `assembly:get_name()`
@@ -348,6 +341,21 @@ end)
 <a id="api-class"></a>
 
 ### 🧬 `Class`：类型
+
+| API | 作用 |
+| --- | --- |
+| [类型信息](#class-information) | 获取名称、继承关系、特征、大小和地址 |
+| [`class:get_method`](#class-get-method) | 查找方法或精确重载 |
+| [`class:get_methods`](#class-get-method) | 枚举方法 |
+| [`class:get_field`](#class-get-field) | 查找字段 |
+| [`class:get_fields`](#class-get-field) | 枚举字段 |
+| [`class:new`](#class-new) | 创建并构造对象 |
+| [`class:alloc`](#class-new) | 只分配对象 |
+| [`class:new_array`](#class-new-array) | 创建一维托管数组 |
+| [`class:static_call`](#class-static-call) | 调用静态方法 |
+| [`class:read_static_field` / `write_static_field`](#class-static-field) | 读写静态字段 |
+| [`class:find_unity_objects`](#class-find-unity-objects) | 查找存活的 Unity 对象 |
+| [`class:dump`](#class-find-unity-objects) | 输出类型概览 |
 
 类型信息接口包括 `get_name`、`get_namespace`、`get_full_name`、`get_assembly`、
 `get_parent`、`is_value_type`、`is_enum`、`get_instance_size` 和 `get_address`。
@@ -480,6 +488,15 @@ enemy:dump()
 
 ### 🎮 `Instance`：托管对象与容器
 
+| API / 语法 | 作用 |
+| --- | --- |
+| [`instance:call`](#instance-call) | 调用实例方法 |
+| [`instance:read_field` / `write_field`](#instance-field) | 读写实例字段 |
+| [`instance:get_class` / `get_address`](#instance-information) | 获取类型和地址 |
+| [`instance:dump`](#instance-dump) | 输出对象或容器内容 |
+| [`#obj` / `obj[index]`](#instance-container-syntax) | 访问数组或 List 元素 |
+| [`instance:each`](#instance-container-syntax) | 遍历数组或 List |
+
 支持 `call`、`read_field`、`write_field`、`get_class`、`get_address`、`dump` 和 `each`。
 数组与 `List<T>` 使用 Lua 1 基索引：`#obj` 获取长度，`obj[index]` 读写元素；普通
 对象不支持长度运算和数字下标。
@@ -553,6 +570,13 @@ inventory:dump()
 <a id="api-method"></a>
 
 ### 🔧 `Method`：精确方法
+
+| API | 作用 |
+| --- | --- |
+| [方法信息](#method-information) | 获取名称、签名和地址 |
+| [`method:call`](#method-call) | 精确调用方法 |
+| [`method:hook`](#method-hook) | 安装 Lua Hook |
+| [`method:is_hooked` / `unhook`](#method-hook-state) | 查询或移除 Hook |
 
 支持 `get_name`、`get_class`、`get_signature`、`get_address`、`call`、`hook`、
 `is_hooked` 和 `unhook`。实例 Hook 回调为 `function(this, original, ...)`；静态 Hook
@@ -635,6 +659,11 @@ end
 <a id="api-field"></a>
 
 ### 🏷️ `Field`：精确字段
+
+| API | 作用 |
+| --- | --- |
+| [字段信息](#field-information) | 获取名称、签名和偏移 |
+| [`field:read` / `write`](#field-read-write) | 精确读写字段 |
 
 支持 `get_name`、`get_class`、`get_signature`、`get_offset`、`read` 和 `write`。
 实例字段操作传入 Instance；静态字段不传 Instance。`const` 字段不可写。
