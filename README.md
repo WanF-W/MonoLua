@@ -182,20 +182,6 @@ print(lua.hex(field:get_offset()))
 | [`mono.get_tick`](#mono-set-tick) | 获取当前 tick |
 | [`mono.is_tick_ready`](#mono-set-tick) | 判断 tick 是否就绪 |
 
-| API | 作用 |
-| --- | --- |
-| `mono.get_status()` | 获取 Mono、程序集与主线程调度状态 |
-| `mono.is_initialized()` | 判断 Mono 是否初始化完成 |
-| `mono.get_assemblies()` | 枚举全部程序集 |
-| `mono.get_assembly(name)` | 按名称查找程序集，忽略大小写并可省略扩展名 |
-| `mono.get_class(namespace, name)` | 跨程序集查找类型 |
-| `mono.wrap(address)` | 校验并包装裸 Mono 对象地址 |
-| `mono.unhook_all()` | 禁用全部用户方法 Hook |
-| `mono.schedule(callback)` | 向 Unity 主线程投递任务 |
-| `mono.set_tick(method)` | 设置主线程调度 tick 方法 |
-| `mono.get_tick()` | 获取当前 tick 方法 |
-| `mono.is_tick_ready()` | 判断 tick Hook 是否就绪 |
-
 <a id="mono-get-status"></a>
 
 #### `mono.get_status()` / `mono.is_initialized()`
