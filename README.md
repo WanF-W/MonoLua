@@ -1,30 +1,31 @@
 <div align="center">
 
-# MonoLua
+# 🧩 MonoLua
 
 在 Windows x64 Unity Mono 游戏进程中使用 Lua 查找程序集、访问类型和对象、调用方法、读写字段以及 Hook 方法。
 
 </div>
 
-## 目录
+## 📑 目录
 
-- [使用条件](#使用条件)
-- [启动与连接](#启动与连接)
-- [Lua API](#lua-api)
-  - [`lua`](#lua)
-  - [`mono`](#mono)
-  - [`Assembly`](#assembly)
-  - [`Class`](#class)
-  - [`Instance`](#instance)
-  - [`Method`](#method)
-  - [`Field`](#field)
-- [类型映射](#类型映射)
-- [线程与 Hook](#线程与-hook)
-- [Lune 命令行](#lune-命令行)
-- [构建](#构建)
-- [限制](#限制)
+- [✅ 使用条件](#usage-conditions)
+- [🚀 启动与连接](#quick-start)
+- [📚 Lua API](#api-reference)
+  - [🧰 `lua`](#api-lua)
+  - [⚙️ `mono`](#api-mono)
+  - [📦 `Assembly`](#api-assembly)
+  - [🧬 `Class`](#api-class)
+  - [🎮 `Instance`](#api-instance)
+  - [🔧 `Method`](#api-method)
+  - [🏷️ `Field`](#api-field)
+- [🔄 类型映射](#type-mapping)
+- [🪝 线程与 Hook](#hook-threading)
+- [💻 Lune 命令行](#lune-cli)
+- [🔨 构建](#build)
+- [⚠️ 限制](#limitations)
 
-## 使用条件
+<a name="usage-conditions"></a>
+## ✅ 使用条件
 
 - Windows x64。
 - 目标程序使用 Unity Mono 运行时。
@@ -33,7 +34,8 @@
 
 MonoLua 读取目标进程中已经加载的 Mono 程序集，不读取未加载的程序集文件，也不适用于 Unity IL2CPP 程序。
 
-## 启动与连接
+<a name="quick-start"></a>
+## 🚀 启动与连接
 
 将 `Lune.exe` 和 `MonoLua.dll` 放在同一目录。先启动游戏，再使用 Lune 的 Mono 后端连接目标进程。
 
@@ -84,11 +86,24 @@ end)
 
 `find_unity_objects()` 需要在 Unity 主线程调用，因此放在 `mono.schedule()` 中。字段名、方法名、命名空间和类型名必须替换为目标游戏中的实际元数据。
 
-## Lua API
+<a name="api-reference"></a>
+## 📚 Lua API
 
-### `lua`
+| 模块 | 说明 |
+| --- | --- |
+| [`lua`](#api-lua) | Lua 辅助函数 |
+| [`mono`](#api-mono) | Mono 运行时入口、查找与调度 |
+| [`Assembly`](#api-assembly) | 程序集查询 |
+| [`Class`](#api-class) | 类型查询、对象创建与静态成员操作 |
+| [`Instance`](#api-instance) | 实例、数组与 `List<T>` 操作 |
+| [`Method`](#api-method) | 方法信息、调用与 Hook |
+| [`Field`](#api-field) | 字段信息、读取与写入 |
 
-#### `lua.each(table, callback)`
+<a name="api-lua"></a>
+### 🧰 `lua`
+
+<a name="api-lua-each"></a>
+#### 🔁 `lua.each(table, callback)`
 
 遍历 Lua table。回调参数为 `value, key`。
 
@@ -102,7 +117,8 @@ lua.each({ hp = 100, mp = 50 }, function(value, key)
 end)
 ```
 
-#### `lua.dump(table)`
+<a name="api-lua-dump"></a>
+#### 🧾 `lua.dump(table)`
 
 输出 Lua table 的第一层键值，不递归展开嵌套 table。
 
@@ -110,7 +126,8 @@ end)
 lua.dump({ name = "Player", stats = { hp = 100 } })
 ```
 
-#### `lua.hex(value)`
+<a name="api-lua-hex"></a>
+#### 🔢 `lua.hex(value)`
 
 将整数或地址格式化为十六进制字符串。它不改变原值。
 
@@ -120,7 +137,8 @@ print(lua.hex(object:get_address()))
 print(lua.hex(field:get_offset()))
 ```
 
-### `mono`
+<a name="api-mono"></a>
+### ⚙️ `mono`
 
 | API | 返回值或作用 |
 | --- | --- |
@@ -137,7 +155,8 @@ print(lua.hex(field:get_offset()))
 | `mono.get_tick()` | 返回 tick 方法签名，未设置时返回 `nil` |
 | `mono.is_tick_ready()` | 返回 tick 是否已经识别执行线程 |
 
-#### 运行时状态
+<a name="mono-runtime-status"></a>
+#### 📊 运行时状态
 
 ```lua
 assert(mono.is_initialized(), "Mono runtime is not ready")
@@ -148,7 +167,8 @@ for _, name in ipairs(mono.get_missing_exports()) do
 end
 ```
 
-#### 程序集查找
+<a name="mono-assembly-search"></a>
+#### 🔎 程序集查找
 
 程序集名称不区分大小写，可以带或不带 `.dll` 后缀。
 
@@ -165,7 +185,8 @@ local player = mono.get_class("Game", "Player")
 
 `mono.get_class()` 在全部已加载程序集内查找。存在同名类型时，使用 `assembly:get_class()` 指定程序集。
 
-#### 地址包装
+<a name="mono-address-wrap"></a>
+#### 📍 地址包装
 
 `mono.wrap()` 接受整数或 `lightuserdata` 地址，并返回经过运行时校验的 Instance。
 
@@ -180,7 +201,8 @@ end
 
 地址可能因对象销毁、内存复用或运行时状态变化而失效，不要长期保存未经验证的裸地址。
 
-#### 主线程调度
+<a name="mono-main-thread"></a>
+#### 🧵 主线程调度
 
 `mono.schedule(callback)` 不同步返回回调结果。回调必须是无参函数；成功调用表示任务已经入队。
 
@@ -208,7 +230,8 @@ print(mono.is_tick_ready())
 
 任务队列最多保存 1024 项；队列满时 `mono.schedule()` 抛出错误。没有可用 tick 时，任务会保留到 tick 设置完成后执行。
 
-### `Assembly`
+<a name="api-assembly"></a>
+### 📦 `Assembly`
 
 Assembly 表示一个已加载的 Mono 程序集。
 
@@ -230,11 +253,24 @@ for _, class in ipairs(game:get_classes()) do
 end
 ```
 
-### `Class`
+<a name="api-class"></a>
+### 🧬 `Class`
 
 Class 表示一个 Mono 类型。
 
-#### 类型信息
+| API 区域 | 说明 |
+| --- | --- |
+| [类型信息](#class-information) | 查看类型名称、继承关系、大小和地址 |
+| [方法查找](#class-methods) | 查找方法和重载 |
+| [字段查找](#class-fields) | 查找字段 |
+| [创建对象](#class-new) | 分配并构造对象 |
+| [创建数组](#class-array) | 创建托管数组 |
+| [静态方法](#class-static-call) | 调用静态方法 |
+| [静态字段](#class-static-field) | 读取和写入静态字段 |
+| [Unity 对象查找](#class-find-unity-objects) | 查询场景中的 Unity 对象 |
+
+<a name="class-information"></a>
+#### 📋 类型信息
 
 | API | 返回值 |
 | --- | --- |
@@ -262,7 +298,8 @@ print(lua.hex(class:get_address()))
 class:dump()
 ```
 
-#### 方法查找
+<a name="class-methods"></a>
+#### 🔍 方法查找
 
 ```lua
 local update = class:get_method("Update")
@@ -285,7 +322,8 @@ local stringArray = class:get_method("Find", "string[]")
 
 `get_method()` 会沿父类查找普通方法；构造函数 `.ctor` 和类型初始化方法 `.cctor` 只在声明类查找。`get_methods()` 只枚举该 Class 声明的方法。
 
-#### 字段查找
+<a name="class-fields"></a>
+#### 🏷️ 字段查找
 
 ```lua
 local health = class:get_field("health")
@@ -298,7 +336,8 @@ end
 
 `get_field()` 和 `get_fields()` 只处理该 Class 声明的字段。Instance 字段读写以及 Class 的静态字段便捷接口会沿父类查找。
 
-#### 创建对象
+<a name="class-new"></a>
+#### 🆕 创建对象
 
 ```lua
 local object = class:new(arg1, arg2)
@@ -307,7 +346,8 @@ local raw = class:alloc()
 
 `new()` 会查找匹配的构造函数并执行；`alloc()` 只分配对象，不执行构造函数。值类型无参数且没有显式构造函数时，`new()` 返回默认值对象。
 
-#### 创建数组
+<a name="class-array"></a>
+#### 🧱 创建数组
 
 ```lua
 local intClass = mono.get_class("System", "Int32")
@@ -322,7 +362,8 @@ objects[2] = nil
 
 数组使用 Lua 1 基索引，长度必须是非负整数。
 
-#### 静态方法
+<a name="class-static-call"></a>
+#### ⚡ 静态方法
 
 ```lua
 local manager = mono.get_class("Game", "PlayerManager")
@@ -332,7 +373,8 @@ manager:static_call("SetDifficulty", 2)
 
 `static_call()` 会根据 Lua 参数选择静态方法重载，并沿父类查找。
 
-#### 静态字段
+<a name="class-static-field"></a>
+#### 🗂️ 静态字段
 
 ```lua
 local manager = mono.get_class("Game", "PlayerManager")
@@ -342,7 +384,8 @@ manager:write_static_field("DebugEnabled", true)
 
 `read_static_field()` 和 `write_static_field()` 会沿父类查找静态字段。常量字段不可写。
 
-#### Unity 对象查找
+<a name="class-find-unity-objects"></a>
+#### 🎮 Unity 对象查找
 
 ```lua
 local enemy = mono.get_class("Game", "EnemyController")
@@ -362,11 +405,20 @@ end)
 
 查询类型必须继承 `UnityEngine.Object`。返回值是 Instance table；没有匹配对象时返回空 table，查询失败时返回 `nil, error`。
 
-### `Instance`
+<a name="api-instance"></a>
+### 🎮 `Instance`
 
 Instance 表示一个托管对象，也用于表示数组、`List<T>` 和装箱后的值类型。
 
-#### 实例信息
+| API 区域 | 说明 |
+| --- | --- |
+| [实例信息](#instance-information) | 查看实例类型、地址和字段 |
+| [实例方法](#instance-methods) | 调用实例方法 |
+| [实例字段](#instance-fields) | 读取和写入实例字段 |
+| [数组与 List](#instance-containers) | 访问数组和 `List<T>` |
+
+<a name="instance-information"></a>
+#### 📋 实例信息
 
 ```lua
 print(object:get_class():get_full_name())
@@ -381,7 +433,8 @@ print(object)
 | `instance:dump()` | 输出实例字段 |
 | `instance:dump(true)` | 连同父类实例字段一起输出 |
 
-#### 实例方法
+<a name="instance-methods"></a>
+#### 📞 实例方法
 
 ```lua
 local player = class:new()
@@ -394,7 +447,8 @@ print(getLevel:call(player))
 
 `instance:call(name, ...)` 根据 Lua 参数选择实例方法重载。`void` 方法没有 Lua 返回值。
 
-#### 实例字段
+<a name="instance-fields"></a>
+#### 📝 实例字段
 
 ```lua
 print(player:read_field("health"))
@@ -404,7 +458,8 @@ player:write_field("target", nil)
 
 静态字段必须使用 `Field:read/write` 或 `Class:read_static_field/write_static_field`。
 
-#### 数组与 List
+<a name="instance-containers"></a>
+#### 📚 数组与 List
 
 数组和 `List<T>` 使用 Lua 1 基索引：
 
@@ -422,7 +477,8 @@ items:dump()
 
 普通对象不支持长度运算或数字下标。容器越界、非整数下标和多维数组会抛出错误。
 
-### `Method`
+<a name="api-method"></a>
+### 🔧 `Method`
 
 | API | 作用 |
 | --- | --- |
@@ -445,7 +501,8 @@ print(getLevel:call(player))
 print(getCurrent:call())
 ```
 
-### `Field`
+<a name="api-field"></a>
+### 🏷️ `Field`
 
 | API | 作用 |
 | --- | --- |
@@ -477,7 +534,8 @@ instanceField:write(player)
 
 常量字段不可写。值类型字段可以写入装箱后的值类型 Instance；传入 `nil` 表示值类型默认零值。
 
-## 类型映射
+<a name="type-mapping"></a>
+## 🔄 类型映射
 
 | Mono 类型 | Lua 类型 |
 | --- | --- |
@@ -494,9 +552,10 @@ instanceField:write(player)
 
 不支持原生指针类型、函数指针、`ref/out`、byref 返回值和 `Nullable<T>`。
 
-## 线程与 Hook
+<a name="hook-threading"></a>
+## 🪝 线程与 Hook
 
-### Unity 主线程
+### 🧵 Unity 主线程
 
 MonoLua 命令可以从控制线程执行，但 Unity API 和 Unity 对象应在 Unity 主线程使用：
 
@@ -514,7 +573,7 @@ end)
 
 `mono.schedule()` 的任务在 tick 线程执行。自动 tick 无法确认执行线程就是 Unity 主线程时，使用 `mono.set_tick()` 指定合适的入口。
 
-### Hook 回调
+### 🪝 Hook 回调
 
 实例方法回调格式：
 
@@ -552,7 +611,8 @@ mono.unhook_all()
 
 Hook 回调可能在任意游戏线程执行。高频 Hook 中不要进行大量打印、文件 IO 或长时间 Lua 计算。Hook 只支持 Windows x64；泛型方法、实例化泛型方法、包含 `ref/out` 或 byref 的方法、结构体 ABI 方法和值类型声明类不能 Hook，方法参数最多 64 个。
 
-## Lune 命令行
+<a name="lune-cli"></a>
+## 💻 Lune 命令行
 
 ```text
 Lune.exe -m --name <进程名> [--dll <DLL路径>] [--lua <脚本路径>]
@@ -584,7 +644,8 @@ Lune.exe -m --name Game.exe --lua C:\Scripts\startup.lua
 dofile([[C:\Scripts\test.lua]])
 ```
 
-## 构建
+<a name="build"></a>
+## 🔨 构建
 
 构建环境：
 
@@ -595,7 +656,8 @@ dofile([[C:\Scripts\test.lua]])
 
 在 Visual Studio 中打开 `MonoLua.slnx`，选择 `Release | x64` 生成 `MonoLua.dll`。
 
-## 限制
+<a name="limitations"></a>
+## ⚠️ 限制
 
 - 仅支持 Windows x64 Unity Mono 进程。
 - 只能访问已经加载到目标进程的程序集和类型。
