@@ -1,457 +1,326 @@
-/**
- * ============================================================
- * pipe_channel.cpp — DLL 端管道通信客户端实现
- * ============================================================
- * 本文件实现 pipe_channel.h 中声明的 PipeChannel 类 
- *
- * 模块组成
- * 
- * ·单例获取与析构
- * ·初始化（读共享内存 → 连接管道）
- * ·帧发送（线程安全 互斥锁保护）
- * ·帧接收（阻塞读取 仅在主线程调用）
- * ·关闭
- *
- * 共享内存机制
- * 
- * ·注入器在注入 DLL 之前创建一块共享内存 
- * ·名称格式为 "MonoLua_Config_<PID>" 
- * ·内容为命名管道的完整路径（宽字符串） 
- * ·DLL 加载后通过 OpenFileMappingW 打开并读取 
- *
- * 命名管道连接
- * 
- * ·使用 CreateFileW 连接到 EXE 创建的管道服务器 
- * ·如果服务器尚未就绪（ERROR_PIPE_BUSY） 
- * ·使用 WaitNamedPipeW 等待服务器调用 ConnectNamedPipe 
- * ============================================================
- */
-
+// The wire contract matches Lune's MONO_PROFILE. Transport policy stays local to this module.
 #include "pipe_channel.h"
+#include <algorithm>
 
-// ============================================================
-// 单例获取 C++11 线程安全的局部静态变量初始化
-// ============================================================
+namespace
+{
+    constexpr DWORD CONNECT_TIMEOUT = 15000;
+    constexpr DWORD WRITE_TIMEOUT = 2000;
+    constexpr size_t LOG_CHUNK_SIZE = 64 * 1024;
+    constexpr size_t MAX_LOG_QUEUE = 1024;
+    constexpr size_t MAX_LOG_QUEUE_BYTES = 4 * 1024 * 1024;
+
+    HANDLE OpenPipe(const std::wstring& name)
+    {
+        const ULONGLONG deadline = GetTickCount64() + CONNECT_TIMEOUT;
+        for (;;)
+        {
+            HANDLE pipe = CreateFileW(name.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING,
+                                      FILE_FLAG_OVERLAPPED, nullptr);
+            if (pipe != INVALID_HANDLE_VALUE) return pipe;
+            const DWORD error = GetLastError();
+            if (error != ERROR_PIPE_BUSY && error != ERROR_FILE_NOT_FOUND) return INVALID_HANDLE_VALUE;
+            const ULONGLONG now = GetTickCount64();
+            if (now >= deadline) return INVALID_HANDLE_VALUE;
+            if (error == ERROR_PIPE_BUSY)
+                WaitNamedPipeW(name.c_str(), static_cast<DWORD>(deadline - now));
+            else
+                Sleep(50);
+        }
+    }
+} // namespace
+
 PipeChannel& PipeChannel::Instance()
 {
     static PipeChannel instance;
     return instance;
 }
 
-// ============================================================
-// 析构函数 防御性编程 一般正常结束会调用Shutdown
-// ============================================================
 PipeChannel::~PipeChannel()
 {
-    if (m_connected) Shutdown();
+    if (bridge_lifecycle::g_processTerminating.load())
+    {
+        if (m_logThread.joinable()) m_logThread.detach();
+        return;
+    }
+    Shutdown();
 }
 
-// ============================================================
-// 初始化
-// ============================================================
+bool PipeChannel::ReadPipeName(std::wstring& name)
+{
+    wchar_t mappingName[128]{};
+    swprintf_s(mappingName, L"%s%lu", protocol::SHARED_MEM_PREFIX, GetCurrentProcessId());
+    HANDLE mapping = OpenFileMappingW(FILE_MAP_READ, FALSE, mappingName);
+    if (!mapping) return false;
+    const auto* data =
+        static_cast<const wchar_t*>(MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, protocol::SHARED_MEM_SIZE));
+    if (!data)
+    {
+        CloseHandle(mapping);
+        return false;
+    }
+    const size_t capacity = protocol::SHARED_MEM_SIZE / sizeof(wchar_t);
+    const size_t length = wcsnlen_s(data, capacity);
+    if (length && length < capacity) name.assign(data, length);
+    UnmapViewOfFile(data);
+    CloseHandle(mapping);
+    return !name.empty();
+}
+
 bool PipeChannel::Init()
 {
-    // 防止重复初始化
-    if (m_connected) return true;
-
-    // 优先从共享内存读取管道名称。MLune 当前使用的名称由固定前缀和目标
-    // PID 组成；部分游戏的完整性级别或对象访问控制会阻止 DLL 打开注入器
-    // 创建的映射，此时可以在目标进程内安全地推导出完全相同的名称。
-    std::wstring pipeName;
-    if (!ReadPipeNameFromSharedMemory(pipeName))
+    if (m_connected.load()) return true;
+    Shutdown();
+    // Lune holds the mapping through HELLO. Do not guess a legacy endpoint on configuration failure.
+    std::wstring name;
+    if (!ReadPipeName(name)) return false;
+    HANDLE pipe = OpenPipe(name);
+    if (pipe == INVALID_HANDLE_VALUE) return false;
+    DWORD mode = PIPE_READMODE_BYTE;
+    if (!SetNamedPipeHandleState(pipe, &mode, nullptr, nullptr))
     {
-        wchar_t fallbackName[128]{};
-        swprintf_s(
-            fallbackName,
-            _countof(fallbackName),
-            L"%s%lu",
-            protocol::PIPE_PREFIX,
-            GetCurrentProcessId());
-        pipeName.assign(fallbackName);
-    }
-
-    // 连接到命名管道服务器失败
-    if (!ConnectToPipe(pipeName)) return false;
-
-    // 设置为连接状态
-    m_connected = true;
-
-    // 返回连接成功
-    return true;
-}
-
-// ============================================================
-// 从共享内存读取管道名称
-// ============================================================
-bool PipeChannel::ReadPipeNameFromSharedMemory(std::wstring& outPipeName)
-{
-    // 共享内存名称格式 -> "MonoLua_Config_<PID>"
-    // 注入器用目标进程的 PID 创建共享内存
-    // DLL 用 GetCurrentProcessId() 获取同一个 PID
-    DWORD pid = GetCurrentProcessId();
-    // 共享内存名称缓冲区
-    wchar_t shmName[128];
-    // 拼接得到最终共享内存名称
-    swprintf_s(shmName, 128, L"%s%lu", protocol::SHARED_MEM_PREFIX, pid);
-
-    // 注入器在注入 DLL 前创建共享内存
-    // 理论上 DLL 加载时已存在
-    // 尝试打开共享内存（只读权限）
-    HANDLE hMap = OpenFileMappingW(
-            FILE_MAP_READ, // 只读访问权限
-            FALSE,         // 不继承句柄给子进程
-            shmName);      // 共享内存名称
-
-    // 查不到可能是注入端已经释放或者非 MLune 注入此 DLL
-    if (hMap == nullptr) return false;
-
-    // 映射共享内存到进程地址空间
-    void* mapped = MapViewOfFile(
-        hMap,          // 共享内存句柄
-        FILE_MAP_READ, // 只读访问
-        0,             // 文件偏移高 32 位（从开头开始）
-        0,             // 文件偏移低 32 位
-        0);            // 映射全部（0 = 整个映射）
-
-    // 映射失败
-    if (mapped == nullptr)
-    {
-        CloseHandle(hMap);
+        CloseHandle(pipe);
         return false;
     }
-
-    // 读取管道名称
-    // 共享内存内容为宽字符串（以 '\0' 结尾）
-    // 最多读取 SHARED_MEM_SIZE-1 个 wchar_t（留一个位置给零终止符）
-    const wchar_t* rawData = static_cast<const wchar_t*>(mapped);
-
-    // 限制最大长度 防止缓冲区溢出
-    size_t maxChars = protocol::SHARED_MEM_SIZE / sizeof(wchar_t) - 1;
-    // 安全拷贝 
-    outPipeName.assign(rawData, wcsnlen_s(rawData, maxChars));
-
-    // 清理共享内存资源
-    // 读取完成后立即解除映射并关闭句柄
-    // 共享内存本身由注入器负责释放
-    UnmapViewOfFile(mapped);
-    CloseHandle(hMap);
-
-    // 验证管道名称非空
-    return !outPipeName.empty();
-}
-
-// ============================================================
-// 打开管道客户端句柄（带 ERROR_PIPE_BUSY 重试）
-// ============================================================
-// 服务器已创建管道但尚未调用 ConnectNamedPipe 时 CreateFileW
-// 会返回 ERROR_PIPE_BUSY 需要用 WaitNamedPipeW 等待后重试
-// 句柄必须以 FILE_FLAG_OVERLAPPED 打开:
-// 阻塞模式下同一句柄的读写会被序列化——worker 线程常年阻塞在
-// RecvFrame(ReadFile) 等待命令 若游戏线程的 Hook 回调 print
-// -> SendLog(WriteFile) 复用同一句柄会被 pending read 卡死
-// 重叠模式下挂起的读不会阻塞其他线程的写
-static HANDLE OpenPipeClient(const std::wstring& pipeName, DWORD access)
-{
-    // 注入远程线程和 MLune 的 ConnectNamedPipe 启动存在很小的竞态窗口。
-    // 对“管道尚未出现”和“实例正忙”进行有界重试；访问被拒绝、名称非法等
-    // 永久错误立即返回，避免掩盖真实配置问题。
-    const ULONGLONG deadline = GetTickCount64() + protocol::WAITSERVER_BUSY;
-    for (;;)
     {
-        HANDLE pipe = CreateFileW(
-            pipeName.c_str(),     // 管道名称
-            access,               // 读/写权限
-            0,                    // 不共享
-            nullptr,              // 默认安全属性
-            OPEN_EXISTING,        // 管道必须已存在
-            FILE_FLAG_OVERLAPPED, // 重叠模式（挂起读不阻塞同句柄写）
-            nullptr);             // 无模板文件
-        if (pipe != INVALID_HANDLE_VALUE) return pipe;
-
-        const DWORD error = GetLastError();
-        if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PIPE_BUSY)
-        {
-            return INVALID_HANDLE_VALUE;
-        }
-
-        const ULONGLONG now = GetTickCount64();
-        if (now >= deadline) return INVALID_HANDLE_VALUE;
-
-        if (error == ERROR_PIPE_BUSY)
-        {
-            const DWORD remaining = static_cast<DWORD>(deadline - now);
-            WaitNamedPipeW(pipeName.c_str(), remaining);
-        }
-        else
-        {
-            Sleep(50);
-        }
+        std::lock_guard<std::mutex> lock(m_stateMutex);
+        m_pipe = pipe;
+        m_connected.store(true);
     }
-}
-
-// ============================================================
-// 重叠 I/O 读取（阻塞等待完成）
-// ============================================================
-// 每次调用创建事件 完成或失败后关闭
-// 返回 false 表示管道断开或读取失败
-static bool ReadPipeOverlapped(HANDLE pipe, void* buf, DWORD len, DWORD& bytesRead)
-{
-    OVERLAPPED ov{};
-    ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (ov.hEvent == nullptr) return false;
-
-    BOOL ok = ReadFile(pipe, buf, len, &bytesRead, &ov);
-    if (!ok)
     {
-        // 读取尚未完成 等待事件后取结果
-        if (GetLastError() == ERROR_IO_PENDING)
-        {
-            if (WaitForSingleObject(ov.hEvent, INFINITE) == WAIT_OBJECT_0)
-            {
-                ok = GetOverlappedResult(pipe, &ov, &bytesRead, FALSE);
-            }
-            else
-            {
-                ok = FALSE;
-            }
-        }
-        else
-        {
-            // 管道断开等错误
-            ok = FALSE;
-        }
+        std::lock_guard<std::mutex> lock(m_logMutex);
+        m_logStop = false;
+        m_logEnqueued = m_logCompleted = 0;
     }
-
-    CloseHandle(ov.hEvent);
-    return ok != FALSE;
-}
-
-// ============================================================
-// 重叠 I/O 写入（阻塞等待完成）
-// ============================================================
-// 与 ReadPipeOverlapped 同理 保证挂起的读不阻塞本写入
-static bool WritePipeOverlapped(HANDLE pipe, const void* buf, DWORD len)
-{
-    OVERLAPPED ov{};
-    ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (ov.hEvent == nullptr) return false;
-
-    DWORD written = 0;
-    BOOL ok = WriteFile(pipe, buf, len, &written, &ov);
-    if (!ok)
+    try
     {
-        if (GetLastError() == ERROR_IO_PENDING)
-        {
-            if (WaitForSingleObject(ov.hEvent, INFINITE) == WAIT_OBJECT_0)
-            {
-                ok = GetOverlappedResult(pipe, &ov, &written, FALSE);
-            }
-            else
-            {
-                ok = FALSE;
-            }
-        }
-        else
-        {
-            ok = FALSE;
-        }
+        m_logThread = std::thread(&PipeChannel::LogWriterMain, this);
     }
-
-    CloseHandle(ov.hEvent);
-    return ok != FALSE && written == len;
-}
-
-// ============================================================
-// 连接到命名管道服务器
-// ============================================================
-bool PipeChannel::ConnectToPipe(const std::wstring& pipeName)
-{
-    // 打开唯一的全双工句柄（FILE_FLAG_OVERLAPPED）
-    m_pipe = OpenPipeClient(pipeName, GENERIC_READ | GENERIC_WRITE);
-
-    // 连接失败
-    if (m_pipe == INVALID_HANDLE_VALUE) return false;
-
-    // 设置管道为字节模式
-    // 无论服务器创建时用什么模式 客户端强制设为字节模式
-    // 我们的协议是二进制帧 不依赖 Windows 管道消息边界
-    DWORD pipeMode = PIPE_READMODE_BYTE;
-    SetNamedPipeHandleState(m_pipe, &pipeMode, nullptr, nullptr);
-
+    catch (...)
+    {
+        Shutdown();
+        return false;
+    }
     return true;
 }
 
-// ============================================================
-// 通用帧发送（线程安全）
-// ============================================================
-bool PipeChannel::SendFrame(uint8_t type, const void* data, uint32_t len)
+bool PipeChannel::Transfer(void* buffer, uint32_t length, bool writing)
 {
-    // 前置检查：确保已连接
-    if (!m_connected || m_pipe == INVALID_HANDLE_VALUE) return false;
+    auto* bytes = static_cast<uint8_t*>(buffer);
+    uint32_t offset = 0;
+    while (offset < length)
+    {
+        OVERLAPPED operation{};
+        operation.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!operation.hEvent) return false;
+        HANDLE pipe = INVALID_HANDLE_VALUE;
+        DWORD transferred = 0;
+        BOOL completed = FALSE;
+        DWORD error = ERROR_OPERATION_ABORTED;
+        {
+            std::lock_guard<std::mutex> lock(m_stateMutex);
+            if (m_connected.load())
+            {
+                pipe = m_pipe;
+                completed = writing
+                                ? WriteFile(pipe, bytes + offset, length - offset, &transferred, &operation)
+                                : ReadFile(pipe, bytes + offset, length - offset, &transferred, &operation);
+                if (!completed) error = GetLastError();
+            }
+        }
+        if (!completed && error == ERROR_IO_PENDING)
+        {
+            const DWORD wait = WaitForSingleObject(operation.hEvent, writing ? WRITE_TIMEOUT : INFINITE);
+            if (wait == WAIT_OBJECT_0)
+                completed = GetOverlappedResult(pipe, &operation, &transferred, FALSE);
+            else
+            {
+                CancelIoEx(pipe, &operation);
+                // OVERLAPPED and its buffer must remain alive until cancellation completes.
+                GetOverlappedResult(pipe, &operation, &transferred, TRUE);
+            }
+        }
+        CloseHandle(operation.hEvent);
+        if (!completed || !transferred) return false;
+        offset += transferred;
+    }
+    return true;
+}
 
-    // 加锁保护写操作
-    // 多个线程可能同时调用 SendLog（主线程执行 Lua + Hook 回调线程）
+void PipeChannel::Disconnect()
+{
+    {
+        std::lock_guard<std::mutex> lock(m_stateMutex);
+        m_connected.store(false);
+        if (m_pipe != INVALID_HANDLE_VALUE) CancelIoEx(m_pipe, nullptr);
+    }
+    m_logCondition.notify_all();
+}
+
+bool PipeChannel::SendFrame(uint8_t type, const void* data, uint32_t length)
+{
+    if (length > protocol::MAX_PAYLOAD || (length && !data)) return false;
     std::lock_guard<std::mutex> lock(m_writeMutex);
-
-    // 构造帧头: 1 字节类型 + 4 字节长度（小端）
-    uint8_t header[protocol::HEADER_SIZE]{};
-    header[0] = type;
-    header[1] = static_cast<uint8_t>(len & 0xFF);
-    header[2] = static_cast<uint8_t>((len >> 8) & 0xFF);
-    header[3] = static_cast<uint8_t>((len >> 16) & 0xFF);
-    header[4] = static_cast<uint8_t>((len >> 24) & 0xFF);
-
-    // 写帧头（重叠 I/O 挂起的读不会阻塞本写入）
-    if (!WritePipeOverlapped(m_pipe, header, protocol::HEADER_SIZE)) return false;
-
-    // 写负载
-    if (len > 0 && data != nullptr)
+    if (!m_connected.load()) return false;
+    uint8_t header[protocol::HEADER_SIZE] = {type};
+    for (unsigned index = 0; index < 4; ++index)
+        header[index + 1] = static_cast<uint8_t>(length >> (index * 8));
+    if (!Transfer(header, sizeof(header), true) || !Transfer(const_cast<void*>(data), length, true))
     {
-        if (!WritePipeOverlapped(m_pipe, data, len)) return false;
+        Disconnect();
+        return false;
     }
     return true;
 }
 
-// ============================================================
-// 发送握手帧
-// ============================================================
-bool PipeChannel::SendHello()
-{
-    // 发送 MSG_HELLO 帧 负载为版本字符串
-    // EXE 收到后会检查版本是否匹配
-    return SendFrame(protocol::MSG_HELLO, protocol::VERSION, static_cast<uint32_t>(strlen(protocol::VERSION)));
-}
-
-// ============================================================
-// 发送就绪帧
-// ============================================================
-bool PipeChannel::SendReady(const char* statusMsg)
-{
-    // 发送 MSG_READY 帧 负载为状态描述文本
-    // 例如 "Mono resolved: 42 images, Lua ready"
-    const char* msg = (statusMsg != nullptr) ? statusMsg : "ready";
-    return SendFrame(protocol::MSG_READY, msg, static_cast<uint32_t>(strlen(msg)));
-}
-
-// ============================================================
-// 发送日志帧
-// ============================================================
-bool PipeChannel::SendLog(const char* text)
-{
-    // 发送 MSG_LOG 帧 负载为输出文本
-    // 这是 LuaEngine 的 print 重定向和返回值回显的输出通道
-    if (text == nullptr) return false;
-
-    return SendFrame(protocol::MSG_LOG, text, static_cast<uint32_t>(strlen(text)));
-}
-
-// ============================================================
-// 发送错误帧
-// ============================================================
-bool PipeChannel::SendError(const char* text)
-{
-    // 发送 MSG_ERROR 帧 负载为错误描述
-    // 用于通知 EXE 命令执行失败
-    const char* msg = (text != nullptr) ? text : "unknown error";
-    return SendFrame(protocol::MSG_ERROR, msg, static_cast<uint32_t>(strlen(msg)));
-}
-
-// ============================================================
-// 发送成功帧
-// ============================================================
-bool PipeChannel::SendOk()
-{
-    // 发送 MSG_OK 帧 无负载
-    // 用于通知 EXE 命令执行成功
-    return SendFrame(protocol::MSG_OK, nullptr, 0);
-}
-
-// ============================================================
-// 发送退出帧
-// ============================================================
-bool PipeChannel::SendExit()
-{
-    // 发送 MSG_EXIT 帧 无负载
-    // 通知 EXE 即将断开连接（DLL 卸载）
-    return SendFrame(protocol::MSG_EXIT, nullptr, 0);
-}
-
-// ============================================================
-// 接收帧（阻塞）
-// ============================================================
 bool PipeChannel::RecvFrame(uint8_t& type, std::vector<uint8_t>& payload)
 {
-    // 前置检查
-    if (!m_connected || m_pipe == INVALID_HANDLE_VALUE) return false;
-
-    // ---- 读取帧头: 1 字节类型 + 4 字节长度（小端）----
+    std::lock_guard<std::mutex> lock(m_readMutex);
+    if (!m_connected.load()) return false;
     uint8_t header[protocol::HEADER_SIZE]{};
-    DWORD total = 0;
-    while (total < protocol::HEADER_SIZE)
+    if (!Transfer(header, sizeof(header), false))
     {
-        DWORD chunk = 0;
-        if (!ReadPipeOverlapped(m_pipe, header + total,
-                static_cast<DWORD>(protocol::HEADER_SIZE) - total, chunk) || chunk == 0)
-        {
-            // 管道断开或错误
-            m_connected = false;
-            return false;
-        }
-        total += chunk;
-    }
-
-    // 解析帧头
-    type = header[0];
-    uint32_t len = static_cast<uint32_t>(header[1])
-                 | (static_cast<uint32_t>(header[2]) << 8)
-                 | (static_cast<uint32_t>(header[3]) << 16)
-                 | (static_cast<uint32_t>(header[4]) << 24);
-
-    // 长度校验：防止恶意/损坏的帧头导致缓冲区溢出
-    if (len > protocol::MAX_PAYLOAD)
-    {
-        m_connected = false;
+        Disconnect();
         return false;
     }
-
-    // ---- 读取负载 ----
-    payload.clear();
-    if (len > 0)
+    type = header[0];
+    uint32_t length = 0;
+    for (unsigned index = 0; index < 4; ++index)
+        length |= static_cast<uint32_t>(header[index + 1]) << (index * 8);
+    if (length > protocol::MAX_PAYLOAD)
     {
-        payload.resize(len);
-        total = 0;
-        while (total < len)
-        {
-            DWORD chunk = 0;
-            if (!ReadPipeOverlapped(m_pipe, payload.data() + total, len - total, chunk) || chunk == 0)
-            {
-                m_connected = false;
-                return false;
-            }
-            total += chunk;
-        }
+        Disconnect();
+        return false;
     }
-
+    payload.resize(length);
+    if (!Transfer(payload.data(), length, false))
+    {
+        Disconnect();
+        return false;
+    }
     return true;
 }
 
-// ============================================================
-// 关闭
-// ============================================================
+bool PipeChannel::SendHello()
+{
+    return SendFrame(protocol::MSG_HELLO, protocol::VERSION,
+                     static_cast<uint32_t>(strlen(protocol::VERSION)));
+}
+
+bool PipeChannel::SendReady(const char* message)
+{
+    if (!message) message = "ready";
+    const size_t length = strnlen_s(message, protocol::MAX_PAYLOAD + 1);
+    return length <= protocol::MAX_PAYLOAD && FlushLogs() &&
+           SendFrame(protocol::MSG_READY, message, static_cast<uint32_t>(length));
+}
+
+bool PipeChannel::SendError(protocol::ErrorCategory category, int32_t line, const char* text)
+{
+    std::vector<uint8_t> payload;
+    // Even an oversized Lua error must receive a response, rather than timing out in Lune.
+    if (!protocol::EncodeErrorPayload(category, line, text ? text : "unknown error", payload))
+        protocol::EncodeErrorPayload(category, line, "error message exceeds the protocol limit", payload);
+    return FlushLogs() &&
+           SendFrame(protocol::MSG_ERROR, payload.data(), static_cast<uint32_t>(payload.size()));
+}
+
+bool PipeChannel::SendOk()
+{
+    return FlushLogs() && SendFrame(protocol::MSG_OK, nullptr, 0);
+}
+
+bool PipeChannel::SendExit()
+{
+    return FlushLogs() && SendFrame(protocol::MSG_EXIT, nullptr, 0);
+}
+
+bool PipeChannel::SendLog(const char* text)
+{
+    if (!text || !m_connected.load()) return false;
+    const size_t length = strnlen_s(text, MAX_LOG_QUEUE_BYTES + 1);
+    if (length > MAX_LOG_QUEUE_BYTES) { ++m_droppedLogs; return false; }
+    const size_t chunks = length == 0 ? 1 : (length + LOG_CHUNK_SIZE - 4) / (LOG_CHUNK_SIZE - 3);
+    bool accepted = true;
+    try
+    {
+        std::lock_guard<std::mutex> lock(m_logMutex);
+        if (m_logStop || !m_connected.load() || chunks > MAX_LOG_QUEUE - m_logQueue.size() ||
+            length > MAX_LOG_QUEUE_BYTES - m_logQueuedBytes)
+        {
+            ++m_droppedLogs;
+            return false;
+        }
+        size_t offset = 0;
+        do
+        {
+            size_t bytes = (std::min)(LOG_CHUNK_SIZE, length - offset);
+            // Keep UTF-8 code points within one frame, matching Lune's text decoding.
+            if (offset + bytes < length)
+                while (bytes && (static_cast<unsigned char>(text[offset + bytes]) & 0xC0) == 0x80)
+                    --bytes;
+            if (!bytes && offset < length) bytes = (std::min)(LOG_CHUNK_SIZE, length - offset);
+            m_logQueue.emplace_back(text + offset, bytes);
+            m_logQueuedBytes += bytes;
+            ++m_logEnqueued;
+            offset += bytes;
+        } while (offset < length);
+    }
+    catch (...)
+    {
+        accepted = false;
+        ++m_droppedLogs;
+    }
+    // Also wake the writer if allocation failed after some chunks had already been queued.
+    m_logCondition.notify_all();
+    return accepted;
+}
+
+bool PipeChannel::FlushLogs()
+{
+    std::unique_lock<std::mutex> lock(m_logMutex);
+    const uint64_t target = m_logEnqueued;
+    m_logCondition.wait(
+        lock, [this, target] { return m_logCompleted >= target || !m_connected.load() || m_logStop; });
+    return m_connected.load() && m_logCompleted >= target;
+}
+
+void PipeChannel::LogWriterMain()
+{
+    for (;;)
+    {
+        std::string message;
+        {
+            std::unique_lock<std::mutex> lock(m_logMutex);
+            m_logCondition.wait(lock,
+                                [this] { return m_logStop || !m_connected.load() || !m_logQueue.empty(); });
+            if (m_logStop || !m_connected.load()) return;
+            message = std::move(m_logQueue.front());
+            m_logQueue.pop_front();
+            m_logQueuedBytes -= message.size();
+        }
+        const bool sent = SendFrame(protocol::MSG_LOG, message.data(), static_cast<uint32_t>(message.size()));
+        {
+            std::lock_guard<std::mutex> lock(m_logMutex);
+            ++m_logCompleted;
+        }
+        m_logCondition.notify_all();
+        if (!sent) return;
+    }
+}
+
 void PipeChannel::Shutdown()
 {
-    if (!m_connected) return;
-
-    // 加锁确保没有其他线程正在写入
-    std::lock_guard<std::mutex> lock(m_writeMutex);
-
-    // 关闭管道句柄
-    // 关闭句柄会使任何阻塞的管道操作立即失败返回
-    if (m_pipe != INVALID_HANDLE_VALUE)
+    Disconnect();
     {
-        CloseHandle(m_pipe);
-        m_pipe = INVALID_HANDLE_VALUE;
+        std::lock_guard<std::mutex> lock(m_logMutex);
+        m_logStop = true;
+        m_logQueue.clear();
+        m_logQueuedBytes = 0;
     }
-
-    m_connected = false;
+    m_logCondition.notify_all();
+    if (m_logThread.joinable()) m_logThread.join();
+    std::scoped_lock ioLock(m_readMutex, m_writeMutex);
+    std::lock_guard<std::mutex> stateLock(m_stateMutex);
+    if (m_pipe != INVALID_HANDLE_VALUE) CloseHandle(std::exchange(m_pipe, INVALID_HANDLE_VALUE));
 }

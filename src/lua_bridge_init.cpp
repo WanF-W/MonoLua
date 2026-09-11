@@ -1,13 +1,11 @@
 /**
- * ============================================================
  * lua_bridge_init.cpp — Lua 元表与全局模块注册
- * ============================================================
  * 按 Assembly/Class/Method/Field/Instance 分别建立元表。Instance 自定义
  * __index 以支持数组和 List 索引，其余 userdata 直接以元表作为方法表。
- * ============================================================
  */
 #include "lua_bridge.h"
-extern "C" {
+extern "C"
+{
 #include "lua.h"
 #include "lauxlib.h"
 }
@@ -30,7 +28,7 @@ namespace
         }
         lua_pop(state, 1);
     }
-}
+} // namespace
 
 bool LuaBridge_Init(lua_State* state)
 {

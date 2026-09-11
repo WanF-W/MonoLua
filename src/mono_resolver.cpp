@@ -1,12 +1,11 @@
 /**
- * ============================================================
  * mono_resolver.cpp — Mono 模块与导出解析实现
- * ============================================================
- * 第一阶段只接受正常独立加载并保留 Embedding API 导出的 Mono 环境。
+ * 当前实现只接受正常独立加载并保留 Embedding API 导出的 Mono 环境。
  * 不扫描特征码，不从游戏 EXE 中搜索静态内嵌 Mono，也不加载额外 DLL。
- * ============================================================
  */
 #include "mono_resolver.h"
+#include "mono_metadata.h"
+#include "mono_handle.h"
 
 #include <sstream>
 
@@ -16,35 +15,40 @@ namespace
     {
         switch (flags & 0x0007)
         {
-        case 0x0001: return "private";
-        case 0x0002: return "private protected";
-        case 0x0003: return "internal";
-        case 0x0004: return "protected";
-        case 0x0005: return "protected internal";
-        case 0x0006: return "public";
-        default: return "private";
+        case 0x0001:
+            return "private";
+        case 0x0002:
+            return "private protected";
+        case 0x0003:
+            return "internal";
+        case 0x0004:
+            return "protected";
+        case 0x0005:
+            return "protected internal";
+        case 0x0006:
+            return "public";
+        default:
+            return "private scope";
         }
     }
 
-    // 模块名来自 Windows 宽字符 API。错误信息通过 UTF-8 管道发送给 MLune，
+    // 模块名来自 Windows 宽字符 API。错误信息通过 UTF-8 管道发送给 Lune，
     // 因此不能用 wstring 迭代器直接构造 string；那既会产生 C4244，也会在
     // 文件名包含非 ASCII 字符时破坏文本。
     std::string WideToUtf8(const std::wstring& value)
     {
         if (value.empty()) return {};
 
-        const int size = WideCharToMultiByte(
-            CP_UTF8, 0, value.data(), static_cast<int>(value.size()),
-            nullptr, 0, nullptr, nullptr);
+        const int size = WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()),
+                                             nullptr, 0, nullptr, nullptr);
         if (size <= 0) return "<invalid module name>";
 
         std::string result(static_cast<size_t>(size), '\0');
-        WideCharToMultiByte(
-            CP_UTF8, 0, value.data(), static_cast<int>(value.size()),
-            result.data(), size, nullptr, nullptr);
+        WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), result.data(), size,
+                            nullptr, nullptr);
         return result;
     }
-}
+} // namespace
 
 MonoResolver& MonoResolver::Instance()
 {
@@ -59,15 +63,15 @@ bool MonoResolver::Init()
 
     // Unity 不同年代常见的模块名不同。优先检查新版 bdwgc 名称，再兼容
     // 老版本 mono.dll。只使用 GetModuleHandleW，绝不主动加载另一套 Mono。
-    static constexpr const wchar_t* candidates[] = {
-        L"mono-2.0-bdwgc.dll",
-        L"mono-2.0-sgen.dll",
-        L"mono.dll"
-    };
+    static constexpr const wchar_t* candidates[] = {L"mono-2.0-bdwgc.dll", L"mono-2.0-sgen.dll", L"mono.dll"};
     for (const wchar_t* candidate : candidates)
     {
         m_module = GetModuleHandleW(candidate);
-        if (m_module != nullptr) { m_moduleName = candidate; break; }
+        if (m_module != nullptr)
+        {
+            m_moduleName = candidate;
+            break;
+        }
     }
     if (m_module == nullptr)
     {
@@ -112,8 +116,7 @@ bool MonoResolver::ResolveExports()
 
     // required 缺少任意一个都会使最小反射链路不成立；optional 缺失只
     // 关闭对应能力并记录到状态中，不能留下空函数指针继续执行。
-    const auto required = [this](auto& target, const char* name)
-    {
+    const auto required = [this](auto& target, const char* name) {
         ++m_exportCount;
         target = reinterpret_cast<std::remove_reference_t<decltype(target)>>(GetProcAddress(m_module, name));
         if (target != nullptr)
@@ -126,15 +129,17 @@ bool MonoResolver::ResolveExports()
         }
         return target != nullptr;
     };
-    const auto optional = [this](auto& target, const char* name)
-    {
+    const auto optional = [this](auto& target, const char* name) {
         ++m_exportCount;
         target = reinterpret_cast<std::remove_reference_t<decltype(target)>>(GetProcAddress(m_module, name));
-        if (target != nullptr) ++m_resolvedCount; else m_missingOptional.emplace_back(name);
+        if (target != nullptr)
+            ++m_resolvedCount;
+        else
+            m_missingOptional.emplace_back(name);
     };
 
     // 下列导出覆盖反射、调用、对象、数组和值类型的完整公开能力。
-    // 对象头深度校验和线程分离属于增强能力，仍按 optional 处理。
+    // 线程 attach/detach 必须成对可用；诊断和对象头深度校验按 optional 处理。
     bool ok = true;
     ok &= required(m_getRootDomain, "mono_get_root_domain");
     ok &= required(m_domainGet, "mono_domain_get");
@@ -163,6 +168,8 @@ bool MonoResolver::ResolveExports()
     ok &= required(m_methodSignature, "mono_method_signature");
     ok &= required(m_methodGetFlags, "mono_method_get_flags");
     optional(m_methodIsGeneric, "mono_method_is_generic");
+    optional(m_methodGetObject, "mono_method_get_object");
+    optional(m_methodGetParamNames, "mono_method_get_param_names");
     optional(m_methodIsInflated, "mono_method_is_inflated");
     ok &= required(m_signatureGetReturnType, "mono_signature_get_return_type");
     ok &= required(m_signatureGetParams, "mono_signature_get_params");
@@ -183,11 +190,12 @@ bool MonoResolver::ResolveExports()
     optional(m_fieldStaticGetValue, "mono_field_static_get_value");
     optional(m_fieldStaticSetValue, "mono_field_static_set_value");
     optional(m_runtimeClassInit, "mono_runtime_class_init");
-    ok &= required(m_stringNew, "mono_string_new");
-    ok &= required(m_stringToUtf8, "mono_string_to_utf8");
+    optional(m_stringNewLen, "mono_string_new_len");
+    optional(m_stringChars, "mono_string_chars");
+    optional(m_stringLength, "mono_string_length");
     ok &= required(m_runtimeInvoke, "mono_runtime_invoke");
     ok &= required(m_objectUnbox, "mono_object_unbox");
-    ok &= required(m_objectToString, "mono_object_to_string");
+    optional(m_objectToString, "mono_object_to_string");
     optional(m_compileMethod, "mono_compile_method");
     optional(m_arrayLength, "mono_array_length");
     optional(m_arrayAddrWithSize, "mono_array_addr_with_size");
@@ -206,11 +214,10 @@ bool MonoResolver::ResolveExports()
     ok &= required(m_gcHandleNew, "mono_gchandle_new");
     ok &= required(m_gcHandleGetTarget, "mono_gchandle_get_target");
     ok &= required(m_gcHandleFree, "mono_gchandle_free");
-    optional(m_threadCurrent, "mono_thread_current");
-    optional(m_threadDetach, "mono_thread_detach");
-    optional(m_objectGetVTable, "mono_object_get_vtable");
+    ok &= required(m_threadDetach, "mono_thread_detach");
+    ok &= required(m_objectGetVTable, "mono_object_get_vtable");
     optional(m_vtableClass, "mono_vtable_class");
-    optional(m_vtableDomain, "mono_vtable_domain");
+    ok &= required(m_vtableDomain, "mono_vtable_domain");
     optional(m_classVTable, "mono_class_vtable");
     return ok;
 }
@@ -224,7 +231,6 @@ void MonoResolver::Shutdown()
     m_rootDomain = nullptr;
     m_getRootDomain = nullptr;
     m_domainGet = nullptr;
-    m_threadCurrent = nullptr;
     m_threadAttach = nullptr;
     m_threadDetach = nullptr;
     m_assemblyForeach = nullptr;
@@ -251,6 +257,8 @@ void MonoResolver::Shutdown()
     m_methodSignature = nullptr;
     m_methodGetFlags = nullptr;
     m_methodIsGeneric = nullptr;
+    m_methodGetObject = nullptr;
+    m_methodGetParamNames = nullptr;
     m_methodIsInflated = nullptr;
     m_signatureGetReturnType = nullptr;
     m_signatureGetParams = nullptr;
@@ -271,8 +279,9 @@ void MonoResolver::Shutdown()
     m_fieldStaticGetValue = nullptr;
     m_fieldStaticSetValue = nullptr;
     m_runtimeClassInit = nullptr;
-    m_stringNew = nullptr;
-    m_stringToUtf8 = nullptr;
+    m_stringNewLen = nullptr;
+    m_stringChars = nullptr;
+    m_stringLength = nullptr;
     m_runtimeInvoke = nullptr;
     m_objectUnbox = nullptr;
     m_objectToString = nullptr;
@@ -307,17 +316,9 @@ std::string MonoResolver::ResolveStatus() const
     output << m_resolvedCount << '/' << m_exportCount << " exports resolved";
     return output.str();
 }
-
-// ============================================================
 // 类型安全的薄包装
-// ============================================================
 // 每个包装都先检查导出和输入指针。Resolver 不在这里制造业务错误文本，
 // 由 Runtime 或 Lua Binding 根据调用语境决定返回 nil 还是抛出 Lua error。
-
-MonoThread* MonoResolver::CurrentThread() const
-{
-    return m_threadCurrent ? m_threadCurrent() : nullptr;
-}
 
 MonoDomain* MonoResolver::CurrentDomain() const
 {
@@ -370,9 +371,7 @@ std::vector<MonoClass*> MonoResolver::EnumerateClasses(MonoImage* image) const
     classes.reserve(static_cast<size_t>(rows));
     for (int row = 1; row <= rows; ++row)
     {
-        MonoClass* klass = m_classGet(
-            image,
-            MONO_TOKEN_TYPE_DEF | static_cast<uint32_t>(row));
+        MonoClass* klass = m_classGet(image, MONO_TOKEN_TYPE_DEF | static_cast<uint32_t>(row));
         if (klass) classes.push_back(klass);
     }
     return classes;
@@ -425,8 +424,7 @@ std::vector<MonoMethod*> MonoResolver::EnumerateMethods(MonoClass* klass) const
     void* iterator = nullptr;
     while (MonoMethod* method = m_classGetMethods(klass, &iterator))
     {
-        if (!m_methodGetClass || m_methodGetClass(method) == klass)
-            methods.push_back(method);
+        if (!m_methodGetClass || m_methodGetClass(method) == klass) methods.push_back(method);
     }
     return methods;
 }
@@ -443,22 +441,25 @@ std::vector<MonoClassField*> MonoResolver::EnumerateFields(MonoClass* klass) con
     void* iterator = nullptr;
     while (MonoClassField* field = m_classGetFields(klass, &iterator))
     {
-        if (!m_fieldGetParent || m_fieldGetParent(field) == klass)
-            fields.push_back(field);
+        if (!m_fieldGetParent || m_fieldGetParent(field) == klass) fields.push_back(field);
     }
     return fields;
 }
 
 MonoClassField* MonoResolver::FindField(MonoClass* klass, const char* name) const
 {
-    MonoClassField* field = m_classGetFieldFromName && klass && name
-        ? m_classGetFieldFromName(klass, name)
-        : nullptr;
+    MonoClassField* field =
+        m_classGetFieldFromName && klass && name ? m_classGetFieldFromName(klass, name) : nullptr;
     // mono_class_get_field_from_name 在部分版本会沿父类查找；MonoLua 的
     // Class API 只允许当前声明类，防止同名隐藏字段产生不确定结果。
-    return field && (!m_fieldGetParent || m_fieldGetParent(field) == klass)
-        ? field
-        : nullptr;
+    return field && (!m_fieldGetParent || m_fieldGetParent(field) == klass) ? field : nullptr;
+}
+
+MonoClassField* MonoResolver::FindFieldInHierarchy(MonoClass* klass, const char* name) const
+{
+    for (MonoClass* current = klass; current; current = ClassParent(current))
+        if (MonoClassField* field = FindField(current, name)) return field;
+    return nullptr;
 }
 
 const char* MonoResolver::MethodName(MonoMethod* method) const
@@ -474,9 +475,7 @@ MonoClass* MonoResolver::MethodClass(MonoMethod* method) const
 std::vector<std::string> MonoResolver::MethodParameterTypes(MonoMethod* method) const
 {
     std::vector<std::string> types;
-    MonoMethodSignature* signature = m_methodSignature && method
-        ? m_methodSignature(method)
-        : nullptr;
+    MonoMethodSignature* signature = m_methodSignature && method ? m_methodSignature(method) : nullptr;
     if (!signature || !m_signatureGetParams || !m_typeGetName) return types;
 
     void* iterator = nullptr;
@@ -495,7 +494,8 @@ std::vector<MonoType*> MonoResolver::MethodParameters(MonoMethod* method) const
     MonoMethodSignature* signature = m_methodSignature && method ? m_methodSignature(method) : nullptr;
     if (!signature || !m_signatureGetParams) return types;
     void* iterator = nullptr;
-    while (MonoType* type = m_signatureGetParams(signature, &iterator)) types.push_back(type);
+    while (MonoType* type = m_signatureGetParams(signature, &iterator))
+        types.push_back(type);
     return types;
 }
 
@@ -514,13 +514,24 @@ bool MonoResolver::MethodIsGeneric(MonoMethod* method) const
 {
     if (!method) return false;
     return (m_methodIsGeneric && m_methodIsGeneric(method) != 0) ||
-        (m_methodIsInflated && m_methodIsInflated(method) != 0);
+           (m_methodIsInflated && m_methodIsInflated(method) != 0);
 }
 
-MonoObject* MonoResolver::Invoke(
-    MonoMethod* method, MonoObject* object, void** parameters, MonoObject** exception) const
+MonoObject* MonoResolver::MethodObject(MonoDomain* domain, MonoMethod* method) const
 {
-    return m_runtimeInvoke && method ? m_runtimeInvoke(method, object, parameters, exception) : nullptr;
+    return m_methodGetObject && domain && method ? m_methodGetObject(domain, method, MethodClass(method))
+                                                 : nullptr;
+}
+
+MonoObject* MonoResolver::Invoke(MonoMethod* method, void* object, void** parameters,
+                                 MonoObject** exception) const
+{
+    MonoObject* result = m_runtimeInvoke && method ? m_runtimeInvoke(method, object, parameters, exception) : nullptr;
+    // A nested detour can quarantine the VM while runtime_invoke is in flight.
+    // Propagate before callers perform reflection, root allocation or Lua error handling.
+    if (bridge_lifecycle::g_sessionFaulted.load())
+        RaiseException(bridge_lifecycle::SESSION_FAULT_CODE, EXCEPTION_NONCONTINUABLE, 0, nullptr);
+    return result;
 }
 
 void* MonoResolver::Unbox(MonoObject* object) const
@@ -530,10 +541,22 @@ void* MonoResolver::Unbox(MonoObject* object) const
 
 std::string MonoResolver::ObjectString(MonoObject* object) const
 {
-    if (!m_objectToString || !object) return {};
+    if (!object) return {};
     MonoObject* nestedException = nullptr;
-    MonoString* text = m_objectToString(object, &nestedException);
-    return !nestedException && text ? StringValue(text) : std::string{};
+    if (m_objectToString)
+    {
+        MonoString* text = m_objectToString(object, &nestedException);
+        return !nestedException && text ? StringValue(text) : std::string{};
+    }
+    for (MonoClass* klass = ObjectClass(object); klass; klass = ClassParent(klass))
+        for (MonoMethod* method : EnumerateMethods(klass))
+            if (strcmp(MethodName(method), "ToString") == 0 && MethodParameters(method).empty())
+            {
+                MonoObject* text = Invoke(method, object, nullptr, &nestedException);
+                return !nestedException && text ? StringValue(reinterpret_cast<MonoString*>(text))
+                                                : std::string{};
+            }
+    return {};
 }
 
 void* MonoResolver::CompileMethod(MonoMethod* method) const
@@ -558,11 +581,9 @@ MonoObject* MonoResolver::NewObject(MonoDomain* domain, MonoClass* klass) const
     return m_objectNew && domain && klass ? m_objectNew(domain, klass) : nullptr;
 }
 
-MonoArray* MonoResolver::NewArray(
-    MonoDomain* domain, MonoClass* elementClass, uintptr_t length) const
+MonoArray* MonoResolver::NewArray(MonoDomain* domain, MonoClass* elementClass, uintptr_t length) const
 {
-    return m_arrayNew && domain && elementClass
-        ? m_arrayNew(domain, elementClass, length) : nullptr;
+    return m_arrayNew && domain && elementClass ? m_arrayNew(domain, elementClass, length) : nullptr;
 }
 
 MonoClass* MonoResolver::ElementClass(MonoClass* arrayClass) const
@@ -572,7 +593,7 @@ MonoClass* MonoResolver::ElementClass(MonoClass* arrayClass) const
 
 int MonoResolver::ClassRank(MonoClass* klass) const
 {
-    return m_classGetRank && klass ? m_classGetRank(klass) : 0;
+    return m_classGetRank && klass ? m_classGetRank(klass) : -1;
 }
 
 int MonoResolver::ArrayElementSize(MonoClass* arrayClass) const
@@ -582,12 +603,11 @@ int MonoResolver::ArrayElementSize(MonoClass* arrayClass) const
 
 void* MonoResolver::ArrayAddress(MonoArray* array, int elementSize, uintptr_t index) const
 {
-    return m_arrayAddrWithSize && array && elementSize > 0
-        ? m_arrayAddrWithSize(array, elementSize, index) : nullptr;
+    return m_arrayAddrWithSize && array && elementSize > 0 ? m_arrayAddrWithSize(array, elementSize, index)
+                                                           : nullptr;
 }
 
-bool MonoResolver::SetArrayReference(
-    MonoArray* array, void* slot, MonoObject* value) const
+bool MonoResolver::SetArrayReference(MonoArray* array, void* slot, MonoObject* value) const
 {
     if (!m_gcWBarrierSetArrayRef || !array || !slot) return false;
     m_gcWBarrierSetArrayRef(array, slot, value);
@@ -606,29 +626,38 @@ bool MonoResolver::CopyValue(void* destination, void* source, MonoClass* klass) 
     return true;
 }
 
-MonoObject* MonoResolver::FieldValueObject(
-    MonoDomain* domain, MonoClassField* field, MonoObject* object) const
+MonoObject* MonoResolver::FieldValueObject(MonoDomain* domain, MonoClassField* field,
+                                           MonoObject* object) const
 {
-    return m_fieldGetValueObject && domain && field
-        ? m_fieldGetValueObject(domain, field, object) : nullptr;
+    return m_fieldGetValueObject && domain && field ? m_fieldGetValueObject(domain, field, object) : nullptr;
+}
+
+std::string MonoResolver::TypeDisplayName(MonoType* type) const
+{
+    char* raw = type && m_typeGetName ? m_typeGetName(type) : nullptr;
+    std::string name = raw ? raw : "<unknown>";
+    if (raw && m_monoFree) m_monoFree(raw);
+    return name;
 }
 
 std::string MonoResolver::MethodSignature(MonoMethod* method) const
 {
     if (!method) return {};
     MonoMethodSignature* signature = m_methodSignature ? m_methodSignature(method) : nullptr;
-    MonoType* returnType = signature && m_signatureGetReturnType
-        ? m_signatureGetReturnType(signature)
-        : nullptr;
+    MonoType* returnType =
+        signature && m_signatureGetReturnType ? m_signatureGetReturnType(signature) : nullptr;
     char* rawReturn = returnType && m_typeGetName ? m_typeGetName(returnType) : nullptr;
 
     std::ostringstream output;
     uint32_t implementationFlags = 0;
-    const uint32_t flags = m_methodGetFlags
-        ? m_methodGetFlags(method, &implementationFlags)
-        : 0;
+    const uint32_t flags = m_methodGetFlags ? m_methodGetFlags(method, &implementationFlags) : 0;
     output << MemberAccess(flags) << ' ';
-    if ((flags & 0x0010) != 0) output << "static ";
+    if ((flags & mono_metadata::METHOD_ATTRIBUTE_STATIC) != 0) output << "static ";
+    if ((flags & 0x0400) != 0)
+        output << "abstract ";
+    else if ((flags & 0x0040) != 0)
+        output << "virtual ";
+    if ((flags & 0x0020) != 0) output << "final ";
     output << (rawReturn ? rawReturn : "<unknown>") << ' ';
     if (rawReturn && m_monoFree) m_monoFree(rawReturn);
     MonoClass* klass = MethodClass(method);
@@ -637,10 +666,16 @@ std::string MonoResolver::MethodSignature(MonoMethod* method) const
     output << (ClassName(klass) ? ClassName(klass) : "<unknown>") << '.';
     output << (MethodName(method) ? MethodName(method) : "<unknown>") << '(';
     const auto parameters = MethodParameterTypes(method);
+    std::vector<const char*> names(parameters.size(), nullptr);
+    if (m_methodGetParamNames && !names.empty()) m_methodGetParamNames(method, names.data());
     for (size_t index = 0; index < parameters.size(); ++index)
     {
         if (index != 0) output << ", ";
-        output << parameters[index];
+        output << parameters[index] << ' ';
+        if (names[index] && *names[index])
+            output << names[index];
+        else
+            output << "arg" << index + 1;
     }
     output << ')';
     return output.str();
@@ -676,9 +711,11 @@ std::string MonoResolver::FieldSignature(MonoClassField* field) const
     std::ostringstream output;
     const uint32_t flags = m_fieldGetFlags ? m_fieldGetFlags(field) : 0;
     output << MemberAccess(flags) << ' ';
-    if ((flags & 0x0010) != 0) output << "static ";
-    if ((flags & 0x0040) != 0) output << "const ";
-    else if ((flags & 0x0020) != 0) output << "readonly ";
+    if ((flags & mono_metadata::FIELD_ATTRIBUTE_STATIC) != 0) output << "static ";
+    if ((flags & mono_metadata::FIELD_ATTRIBUTE_LITERAL) != 0)
+        output << "const ";
+    else if ((flags & mono_metadata::FIELD_ATTRIBUTE_INIT_ONLY) != 0)
+        output << "readonly ";
     output << (rawType ? rawType : "<unknown>") << ' ';
     if (rawType && m_monoFree) m_monoFree(rawType);
     const char* nameSpace = ClassNamespace(klass);
@@ -691,10 +728,9 @@ std::string MonoResolver::FieldSignature(MonoClassField* field) const
 int32_t MonoResolver::FieldOffset(MonoClassField* field) const
 {
     // 静态字段没有相对于实例对象的有效偏移，公开 API 按约定返回 nil。
-    if (m_fieldGetFlags && field && (m_fieldGetFlags(field) & 0x0010) != 0) return -1;
-    return m_fieldGetOffset && field
-        ? static_cast<int32_t>(m_fieldGetOffset(field))
-        : -1;
+    if (m_fieldGetFlags && field && (m_fieldGetFlags(field) & mono_metadata::FIELD_ATTRIBUTE_STATIC) != 0)
+        return -1;
+    return m_fieldGetOffset && field ? static_cast<int32_t>(m_fieldGetOffset(field)) : -1;
 }
 
 int MonoResolver::TypeKind(MonoType* type) const
@@ -717,9 +753,9 @@ MonoType* MonoResolver::ClassType(MonoClass* klass) const
     return m_classGetType && klass ? m_classGetType(klass) : nullptr;
 }
 
-MonoObject* MonoResolver::TypeObject(MonoType* type) const
+MonoObject* MonoResolver::TypeObject(MonoDomain* domain, MonoType* type) const
 {
-    return m_typeGetObject && type ? m_typeGetObject(type) : nullptr;
+    return m_typeGetObject && domain && type ? m_typeGetObject(domain, type) : nullptr;
 }
 
 MonoType* MonoResolver::EnumBaseType(MonoClass* klass) const
@@ -739,11 +775,9 @@ void MonoResolver::WriteField(MonoObject* object, MonoClassField* field, void* v
     if (m_fieldSetValue && object && field) m_fieldSetValue(object, field, value);
 }
 
-bool MonoResolver::ReadStaticField(
-    MonoDomain* domain, MonoClassField* field, void* value) const
+bool MonoResolver::ReadStaticField(MonoDomain* domain, MonoClassField* field, void* value) const
 {
-    if (!m_fieldStaticGetValue || !m_classVTable || !m_runtimeClassInit ||
-        !domain || !field || !value)
+    if (!m_fieldStaticGetValue || !m_classVTable || !m_runtimeClassInit || !domain || !field || !value)
         return false;
     MonoVTable* vtable = m_classVTable(domain, FieldClass(field));
     if (!vtable) return false;
@@ -752,12 +786,9 @@ bool MonoResolver::ReadStaticField(
     return true;
 }
 
-bool MonoResolver::WriteStaticField(
-    MonoDomain* domain, MonoClassField* field, void* value) const
+bool MonoResolver::WriteStaticField(MonoDomain* domain, MonoClassField* field, void* value) const
 {
-    if (!m_fieldStaticSetValue || !m_classVTable || !m_runtimeClassInit ||
-        !domain || !field)
-        return false;
+    if (!m_fieldStaticSetValue || !m_classVTable || !m_runtimeClassInit || !domain || !field) return false;
     MonoVTable* vtable = m_classVTable(domain, FieldClass(field));
     if (!vtable) return false;
     m_runtimeClassInit(vtable);
@@ -771,18 +802,27 @@ MonoDomain* MonoResolver::ObjectDomain(MonoObject* object) const
     return m_vtableDomain(m_objectGetVTable(object));
 }
 
-MonoString* MonoResolver::NewString(MonoDomain* domain, const char* value) const
+MonoString* MonoResolver::NewString(MonoDomain* domain, const char* value, size_t length) const
 {
-    return m_stringNew && domain && value ? m_stringNew(domain, value) : nullptr;
+    return m_stringNewLen && domain && value && length <= UINT32_MAX
+               ? m_stringNewLen(domain, value, static_cast<uint32_t>(length))
+               : nullptr;
 }
 
 std::string MonoResolver::StringValue(MonoString* value) const
 {
-    if (!m_stringToUtf8 || !value) return {};
-    char* text = m_stringToUtf8(value);
-    if (!text) return {};
-    std::string result(text);
-    if (m_monoFree) m_monoFree(text);
+    if (!CanReadStrings() || !value) return {};
+    mono::ScopedGCHandle root(Instance(), CreateGCHandle(reinterpret_cast<MonoObject*>(value), true));
+    if (!root.value) return {};
+    value = reinterpret_cast<MonoString*>(root.Target());
+    const int32_t length = m_stringLength(value);
+    if (length <= 0) return {};
+    const auto* chars = reinterpret_cast<const wchar_t*>(m_stringChars(value));
+    if (!chars) return {};
+    const int bytes = WideCharToMultiByte(CP_UTF8, 0, chars, length, nullptr, 0, nullptr, nullptr);
+    if (bytes <= 0) return {};
+    std::string result(static_cast<size_t>(bytes), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, chars, length, result.data(), bytes, nullptr, nullptr);
     return result;
 }
 

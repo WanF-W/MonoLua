@@ -12,6 +12,9 @@
 *.suo
 *.user
 *.userosscache
+*.env
+.env
+.env.*
 *.sln.docstates
 
 # User-specific files (MonoDevelop/Xamarin Studio)
@@ -401,5 +404,10 @@ FodyWeavers.xsd
 
 ### VisualStudio Patch ###
 # Additional files built by Visual Studio
+
+# Local release materials are uploaded manually and must not enter Git.
+.release_local/
+ReleaseOutline_*.md
+MonoLua_Maintenance_Rules.local.md
 
 # End of https://www.toptal.com/developers/gitignore/api/visualstudio

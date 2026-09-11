@@ -35,7 +35,10 @@
   <ImportGroup Label="ExtensionSettings">
     <Import Project="$(VCTargetsPath)\BuildCustomizations\masm.props" />
   </ImportGroup>
-  <ImportGroup Label="PropertySheets">
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
@@ -45,14 +48,33 @@
       <SDLCheck>true</SDLCheck>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
+      <!-- Bridge locks must unwind on native faults. Lua itself uses /EHs below so its
+           catch-all does not swallow SEH and attempt to continue a damaged VM. -->
+      <ExceptionHandling>Async</ExceptionHandling>
       <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
-      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)lua_src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>_WINDOWS;_USRDLL;LUA_BUILD_AS_DLL;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)lua_src;$(ProjectDir)minhook_src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
-      <SubSystem>Windows</SubSystem>
+      <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
     </Link>
+    <Manifest>
+      <EnableSegmentHeap>true</EnableSegmentHeap>
+    </Manifest>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ClCompile>
+      <PreprocessorDefinitions>_DEBUG;_WINDOWS;_USRDLL;LUA_BUILD_AS_DLL;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <PreprocessorDefinitions>NDEBUG;_WINDOWS;_USRDLL;LUA_BUILD_AS_DLL;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+    </ClCompile>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="lua_src\lapi.c" />
@@ -103,24 +125,32 @@
     <ClCompile Include="src\lua_container.cpp" />
     <ClCompile Include="src\lua_engine.cpp" />
     <ClCompile Include="src\lua_value.cpp" />
+    <ClCompile Include="src\lua_method_call.cpp" />
     <ClCompile Include="src\mono_hook.cpp" />
     <ClCompile Include="src\mono_resolver.cpp" />
     <ClCompile Include="src\mono_runtime.cpp" />
+    <ClCompile Include="src\mono_session.cpp" />
     <ClCompile Include="src\mono_scheduler.cpp" />
     <ClCompile Include="src\pipe_channel.cpp" />
+    <ClCompile Include="src\unity_object_query.cpp" />
     <ClCompile Include="src\lua_userdata.cpp" />
   </ItemGroup>
   <ItemGroup>
     <Masm Include="src\hook_stub.asm" />
   </ItemGroup>
   <!--
-    Lua 与 MinHook 作为原样引入的第三方 C 源码，在 MSVC /W4 和 LTCG 下会
+    Lua 与 MinHook 作为原样引入的第三方源码，在 MSVC /W4 和 LTCG 下会
     产生其上游已知的窄化、对齐、匿名联合及数据流分析警告。仅对各自目录
     局部屏蔽对应诊断；MonoLua 自有 src 仍保持完整 /W4，不做全局降级。
   -->
   <ItemGroup>
     <ClCompile Update="lua_src\*.c">
-      <DisableSpecificWarnings>4244;4310;4324;4701;4702;%(DisableSpecificWarnings)</DisableSpecificWarnings>
+      <!-- Lua C++ exceptions preserve C++ bridge destructors across lua_error. -->
+      <CompileAs>CompileAsCpp</CompileAs>
+      <ForcedIncludeFiles>$(ProjectDir)src\lua_cpp.h;%(ForcedIncludeFiles)</ForcedIncludeFiles>
+      <ExceptionHandling>SyncCThrow</ExceptionHandling>
+      <!-- Lua bounds hash shifts to fit int before converting their result to size_t. -->
+      <DisableSpecificWarnings>4244;4310;4324;4334;4701;4702;%(DisableSpecificWarnings)</DisableSpecificWarnings>
     </ClCompile>
     <ClCompile Update="minhook_src\*.c">
       <DisableSpecificWarnings>4201;4206;4244;4310;%(DisableSpecificWarnings)</DisableSpecificWarnings>
@@ -164,18 +194,25 @@
     <ClInclude Include="minhook_src\table64.h" />
     <ClInclude Include="minhook_src\trampoline.h" />
     <ClInclude Include="src\common.h" />
+    <ClInclude Include="src\lua_cpp.h" />
+    <ClInclude Include="src\lua_dump.h" />
     <ClInclude Include="src\hook_stub.h" />
     <ClInclude Include="src\lua_bridge.h" />
     <ClInclude Include="src\lua_binding_internal.h" />
+    <ClInclude Include="src\lua_value_internal.h" />
     <ClInclude Include="src\lua_engine.h" />
     <ClInclude Include="src\mono_api.h" />
+    <ClInclude Include="src\mono_handle.h" />
+    <ClInclude Include="src\mono_metadata.h" />
     <ClInclude Include="src\mono_hook.h" />
     <ClInclude Include="src\mono_resolver.h" />
     <ClInclude Include="src\mono_runtime.h" />
+    <ClInclude Include="src\mono_session.h" />
     <ClInclude Include="src\mono_scheduler.h" />
     <ClInclude Include="src\pipe_channel.h" />
     <ClInclude Include="src\protocol.h" />
     <ClInclude Include="src\version.h" />
+    <ClInclude Include="src\unity_object_query.h" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="src\version.rc" />

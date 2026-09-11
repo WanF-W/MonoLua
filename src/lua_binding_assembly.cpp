@@ -1,14 +1,12 @@
 /**
- * ============================================================
  * lua_binding_assembly.cpp — Assembly userdata 公开 API
- * ============================================================
  * Assembly userdata 同时保存 MonoAssembly 与对应 MonoImage 借用指针。
  * 类型查找和枚举通过 Image 完成；每次访问先校验 Runtime metadata generation。
- * ============================================================
  */
 #include "lua_bridge.h"
 #include "mono_resolver.h"
-extern "C" {
+extern "C"
+{
 #include "lua.h"
 #include "lauxlib.h"
 }
@@ -33,22 +31,17 @@ namespace
     {
         const LuaAssemblyUD* assembly = LuaBridge_CheckAssembly(state, 1);
         const char* name = MonoResolver::Instance().ImageName(assembly->image);
-        char text[256]{};
-        sprintf_s(text, "Assembly: %s @ 0x%llX",
-            name != nullptr ? name : "<invalid>",
-            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(assembly->assembly)));
-        lua_pushstring(state, text);
+        lua_pushfstring(state, "Assembly: %s @ %p", name ? name : "<invalid>",
+                        static_cast<void*>(assembly->assembly));
         return 1;
     }
 
     int Assembly_GetClass(lua_State* state)
     {
         const LuaAssemblyUD* assembly = LuaBridge_CheckAssembly(state, 1);
-        const char* nameSpace = luaL_checkstring(state, 2);
+        const char* nameSpace = luaL_optstring(state, 2, "");
         const char* name = luaL_checkstring(state, 3);
-        LuaBridge_PushClass(
-            state,
-            MonoResolver::Instance().FindClass(assembly->image, nameSpace, name));
+        LuaBridge_PushClass(state, MonoResolver::Instance().FindClass(assembly->image, nameSpace, name));
         return 1;
     }
 
@@ -64,16 +57,14 @@ namespace
         }
         return 1;
     }
-}
+} // namespace
 
 const luaL_Reg* LuaBinding_GetAssemblyMethods()
 {
-    static const luaL_Reg methods[] = {
-        {"get_name", Assembly_GetName},
-        {"get_class", Assembly_GetClass},
-        {"get_classes", Assembly_GetClasses},
-        {"__tostring", Assembly_ToString},
-        {nullptr, nullptr}
-    };
+    static const luaL_Reg methods[] = {{"get_name", Assembly_GetName},
+                                       {"get_class", Assembly_GetClass},
+                                       {"get_classes", Assembly_GetClasses},
+                                       {"__tostring", Assembly_ToString},
+                                       {nullptr, nullptr}};
     return methods;
 }

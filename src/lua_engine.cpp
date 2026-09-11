@@ -1,494 +1,353 @@
-/**
- * ============================================================
- * lua_engine.cpp — Lua 虚拟机管理模块实现
- * ============================================================
- * 本文件实现 lua_engine.h 中声明的 LuaEngine 类 
- *
- * 模块组成
- * 
- * ·SEH 安全包装器（SEHSafeLoadAndCall）
- * ·单例获取（Instance）
- * ·初始化与关闭（Init / Shutdown）
- * ·代码执行（ExecuteBuffer / ExecuteString / ExecuteFile）
- * ·自定义 print 函数（LuaPrint）
- * ·返回值自动回显（PrintReturnValues）
- *
- * SEH 注意事项
- * 
- * ·MSVC 不允许在同一个函数中混用 C++ 异常处理 (try/catch)
- * ·和结构化异常处理 (__try/__except) 因此将可能崩溃的
- * ·Lua 调用放在独立的 __try/__except 函数中 该函数内
- * ·不包含任何带析构函数的 C++ 对象 
- * ============================================================
- */
-
+// One serialized Lua VM. Ordinary Lua errors unwind C++ owners; native faults end the session.
 #include "lua_engine.h"
 #include "lua_bridge.h"
+#include <cctype>
+#include <charconv>
+#include <cstdarg>
+#include <algorithm>
 
-#include <windows.h>
-
-extern "C" {
+extern "C"
+{
 #include "lua.h"
 #include "lauxlib.h"
 #include "lualib.h"
 }
 
-// ============================================================
-// SEH 安全的 Lua 代码加载与执行
-// ============================================================
-// 将 luaL_loadbuffer + lua_pcall 包裹在 __try/__except 中 
-// 防止 Mono 函数调用引发访问违规 (0xC0000005) 导致 DLL 崩溃 
-//
-// 返回值
-// 
-//   LUA_OK (0)  — 执行成功 返回值在栈顶
-//   其他正值    — Lua 错误码 (LUA_ERRSYNTAX / LUA_ERRRUN 等) 错误信息在栈顶
-//   -1          — 结构化异常 (SEH) 栈状态未知
-//
-// 重要
-// 
-// 此函数内不能有带析构函数的 C++ 对象（如 std::string） 
-// 否则 MSVC 编译会报错 C2712 
-static int SEHSafeLoadAndCall(lua_State* L, const char* buff, size_t size, const char* name)
+namespace
 {
-    __try
+    thread_local LuaEngine::OutputCapture* g_outputCapture = nullptr;
+    constexpr const char* ErrorMetatable = "MonoLua.Error";
+    struct TaggedError { protocol::ErrorCategory category; };
+    int ErrorToString(lua_State* state)
     {
-        // 加载 Lua 代码块
-        // luaL_loadbuffer 将源码编译为 Lua 函数并压入栈顶
-        // name 参数用于错误信息中的代码块标识（如文件名）
-        int status = luaL_loadbuffer(L, buff, size, name);
-        // 加载失败（语法错误等） 错误信息已压入栈顶
-        if (status != LUA_OK) return status;
+        lua_getiuservalue(state, 1, 1);
+        return 1;
+    }
+    int ThrowTaggedError(lua_State* state, protocol::ErrorCategory category)
+    {
+        // The message is already on top. Keeping the tag on the error object means
+        // pcall/error preserves it; caught errors cannot contaminate a later failure.
+        auto* error = static_cast<TaggedError*>(lua_newuserdatauv(state, sizeof(TaggedError), 1));
+        error->category = category;
+        lua_pushvalue(state, -2);
+        lua_setiuservalue(state, -2, 1);
+        if (luaL_newmetatable(state, ErrorMetatable))
+        {
+            lua_pushcfunction(state, ErrorToString);
+            lua_setfield(state, -2, "__tostring");
+            lua_pushliteral(state, "MonoLua error");
+            lua_setfield(state, -2, "__metatable");
+        }
+        lua_setmetatable(state, -2);
+        return lua_error(state);
+    }
+    bool StripLuaSourcePrefix(std::string& message, int32_t& line)
+    {
+        const size_t marker = message.rfind("[string ", 0) == 0 ? message.find("]:") : message.find(':');
+        if (marker == std::string::npos) return false;
+        const size_t start = marker + (message[marker] == ']' ? 2 : 1);
+        size_t end = start;
+        while (end < message.size() && std::isdigit(static_cast<unsigned char>(message[end])))
+            ++end;
+        if (end == start || end == message.size() || message[end] != ':') return false;
+        int32_t parsed = -1;
+        if (std::from_chars(message.data() + start, message.data() + end, parsed).ec != std::errc{})
+            return false;
+        line = parsed;
+        ++end;
+        if (end < message.size() && message[end] == ' ') ++end;
+        message.erase(0, end);
+        return true;
+    }
+} // namespace
 
-        // 执行已加载的代码块
-        // nargs=0              — 该代码块不需要参数
-        // nresults=LUA_MULTRET — 保留所有返回值在栈上
-        // errfunc=0            — 不使用错误处理函数
-        return lua_pcall(L, 0, LUA_MULTRET, 0);
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        // 捕获到结构化异常（如访问违规、除零等）
-        // 此时 Lua 栈状态未知 调用方需自行恢复
-        return -1;
-    }
+int LuaEngine::RaiseBridgeError(lua_State* state, const char* format, ...)
+{
+    va_list arguments;
+    va_start(arguments, format);
+    lua_pushvfstring(state, format, arguments);
+    va_end(arguments);
+    return ThrowTaggedError(state, protocol::ErrorCategory::Mono);
 }
 
-// ============================================================
-// 单例获取
-// ============================================================
+int LuaEngine::RaiseManagedError(lua_State* state, const char* message)
+{
+    lua_pushstring(state, message ? message : "unknown managed exception");
+    return ThrowTaggedError(state, protocol::ErrorCategory::CSharp);
+}
+
+std::string LuaEngine::ErrorText(lua_State* state, int index)
+{
+    const bool tagged = luaL_testudata(state, index, ErrorMetatable) != nullptr;
+    if (tagged) { lua_getiuservalue(state, index, 1); index = -1; }
+    size_t length = 0;
+    const char* value = lua_tolstring(state, index, &length);
+    std::string text = value ? std::string(value, length) : "(non-string error object)";
+    if (tagged) lua_pop(state, 1);
+    return text;
+}
+
+LuaEngine::OutputCapture::OutputCapture() : previous(g_outputCapture)
+{
+    g_outputCapture = this;
+}
+
+LuaEngine::OutputCapture::~OutputCapture()
+{
+    g_outputCapture = previous;
+    auto& engine = LuaEngine::Instance();
+    if (!engine.IsFaulted() && !text.empty() && engine.m_outputCb) engine.m_outputCb(text.c_str());
+}
+
+void LuaEngine::EmitOutput(const char* text)
+{
+    if (!text) return;
+    if (g_outputCapture)
+    {
+        // One command can emit many bounded dumps. Bound the batch as well so it
+        // cannot grow past the transport limit and disappear as a single log.
+        constexpr size_t budget = 1024 * 1024;
+        auto& capture = *g_outputCapture;
+        if (capture.truncated) return;
+        const size_t room = budget - capture.text.size();
+        const size_t length = strnlen_s(text, room + 1);
+        capture.text.append(text, (std::min)(length, room));
+        if (length > room)
+        {
+            capture.text += "\n... <output batch truncated>\n";
+            capture.truncated = true;
+        }
+    }
+    else if (m_outputCb)
+        m_outputCb(text);
+}
+
 LuaEngine& LuaEngine::Instance()
 {
     static LuaEngine instance;
     return instance;
 }
 
-// ============================================================
-// 析构函数
-// ============================================================
 LuaEngine::~LuaEngine()
 {
-    // 析构时确保资源已释放
-    // 如果用户忘记调用 Shutdown 这里兜底清理
-    if (m_initialized) Shutdown();
+    if (!bridge_lifecycle::g_processTerminating.load() && !IsFaulted()) Shutdown();
 }
 
-// ============================================================
-// 初始化
-// ============================================================
-bool LuaEngine::Init(OutputCallback outputCb)
+void LuaEngine::Abort() noexcept
 {
-    // 防止重复初始化
-    if (m_initialized) return true;
+    m_initialized.store(false);
+    if (!bridge_lifecycle::g_sessionFaulted.exchange(true) && m_onFault) m_onFault();
+}
 
-    // 创建 Lua 状态机
-    // luaL_newstate 创建一个新的 Lua 状态机 返回 lua_State* 指针
+int LuaEngine::HandleNativeFault() noexcept
+{
+    // Filters run before stack unwinding: release native locks, but retain Mono roots
+    // and the VM instead of invoking a potentially damaged runtime during cleanup.
+    Abort();
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+void LuaEngine::CheckHealthy() const
+{
+    // Propagate a nested Hook fault to the enclosing native execution boundary without touching Lua.
+    if (IsFaulted()) RaiseException(bridge_lifecycle::SESSION_FAULT_CODE, EXCEPTION_NONCONTINUABLE, 0, nullptr);
+}
+
+LuaEngine::ExecutionError LuaEngine::GetLastError() const
+{
+    if (IsFaulted())
+        return {protocol::ErrorCategory::Mono, -1, "native exception; MonoLua session stopped"};
+    std::lock_guard<std::recursive_mutex> lock(m_luaMutex);
+    return m_lastError;
+}
+
+void LuaEngine::SetLastError(protocol::ErrorCategory category, int32_t line, const char* message)
+{
+    if (IsFaulted()) return;
+    std::lock_guard<std::recursive_mutex> lock(m_luaMutex);
+    m_lastError = {category, line, message ? message : "unknown error"};
+}
+
+bool LuaEngine::Init(OutputCallback output, void (*onFault)())
+{
+    std::lock_guard<std::recursive_mutex> lock(m_luaMutex);
+    if (IsFaulted()) return false;
+    if (IsInitialized()) return true;
+    m_onFault = onFault;
     m_L = luaL_newstate();
-    //创建失败
-    if (m_L == nullptr) return false;
-
-    // luaL_openlibs 加载所有标准库（base, string, table, math, io, os 等）
+    if (!m_L) return false;
+    m_outputCb = std::move(output);
     luaL_openlibs(m_L);
-
-    // 保存输出回调
-    // 必须在替换 print 之前保存 因为 LuaPrint 需要用到
-    m_outputCb = outputCb;
-
-    // 替换 print 函数
-    // 获取全局表 _G 将全局表压入栈顶
-    lua_getglobal(m_L, "_G");
-
-    // 将自定义的 LuaPrint 函数注册为全局 "print"
-    // 将 C 函数压入栈顶
-    lua_pushcfunction(m_L, LuaEngine::LuaPrint);
-    // _G.print = LuaPrint 弹出函数
-    lua_setfield(m_L, -2, "print");
-    // 弹出全局表 恢复栈
-    lua_pop(m_L, 1);
-
-    // 注册 Mono 桥接函数
-    // LuaBridge_Init 创建 userdata 元表并注册 mono 与 lua 全局表
-    // 这一步必须在 Lua VM 创建之后、执行用户代码之前完成
+    lua_pushcfunction(m_L, LuaPrint);
+    lua_setglobal(m_L, "print");
     if (!LuaBridge_Init(m_L))
     {
-        // 桥接层初始化失败 关闭 Lua 状态机
         lua_close(m_L);
         m_L = nullptr;
+        m_outputCb = nullptr;
         return false;
     }
-
-    m_initialized = true;
+    m_initialized.store(true);
     return true;
 }
 
-// ============================================================
-// 关闭
-// ============================================================
 void LuaEngine::Shutdown()
 {
-    if (!m_initialized) return;
-
-    // 加锁保护关闭过程
+    if (IsFaulted()) return;
     std::lock_guard<std::recursive_mutex> lock(m_luaMutex);
-
-    // 关闭 Lua 状态机
-    if (m_L != nullptr)
-    {
-        lua_close(m_L);
-        m_L = nullptr;
-    }
-
-    // 清空输出回调 设置状态
+    if (IsFaulted()) return;
+    lua_State* state = std::exchange(m_L, nullptr);
+    if (state) lua_close(state);
     m_outputCb = nullptr;
-    m_initialized = false;
+    m_initialized.store(false);
 }
 
-// ============================================================
-// 执行 Lua 代码缓冲区（核心实现）
-// ============================================================
-bool LuaEngine::ExecuteBuffer(const char* buff, size_t size, const char* name)
+bool LuaEngine::ExecuteBuffer(const char* buffer, size_t length, const char* name, bool includeLine)
 {
-    if (buff == nullptr || size == 0) return false;
-
-    // Lua 状态机的状态检查和栈基线同样属于受保护数据。Hook 回调可以
-    // 从游戏线程进入 Lua，因此任何锁外访问都会形成真实的数据竞争。
-    std::unique_lock<std::recursive_mutex> luaLock(m_luaMutex);
-    if (!m_initialized || m_L == nullptr) return false;
-    const int baseline = lua_gettop(m_L);
-
-    // SEH 安全执行
-    int status = SEHSafeLoadAndCall(m_L, buff, size, name);
-
-    // 锁在 luaLock 析构时自动释放
-
-    // 处理执行结果
-    if (status == -1)
+    if (IsFaulted()) return false;
+    std::lock_guard<std::recursive_mutex> lock(m_luaMutex);
+    if (IsFaulted()) return false;
+    m_lastError = {};
+    if (!IsInitialized() || !m_L)
     {
-        // 结构化异常：栈状态未知 强制恢复到基线
-        lua_settop(m_L, baseline);
-
-        // 通过输出回调发送错误信息
-        if (m_outputCb) m_outputCb("[SEH exception] access violation during execution\n");
+        m_lastError.message = "Lua engine is not initialized";
         return false;
     }
-    else if (status != LUA_OK)
+    if (!buffer)
     {
-        // Lua 错误（语法错误或运行时错误）
-        // 错误信息在栈顶（baseline + 1 的位置）
-        // 获取错误信息字符串
-        const char* err = lua_tostring(m_L, -1);
-        // 错误对象不是字符串
-        if (err == nullptr) err = "(non-string error object)";
+        m_lastError.message = "empty Lua input";
+        return false;
+    }
+    return RunProtected(buffer, length, name, includeLine);
+}
 
-        // 通过输出回调发送错误信息
-        if (m_outputCb)
+bool LuaEngine::RunProtected(const char* buffer, size_t length, const char* name, bool includeLine)
+{
+    // Keep SEH outside the C++ locals in RunBuffer. An escaped native fault skips Lua's own
+    // call-frame/error-chain restoration, so no lua_settop or lua_close is safe afterwards.
+    __try
+    {
+        return RunBuffer(buffer, length, name, includeLine);
+    }
+    __except (HandleNativeFault())
+    {
+        return false;
+    }
+}
+
+bool LuaEngine::RunBuffer(const char* buffer, size_t length, const char* name, bool includeLine)
+{
+    OutputCapture outputCapture;
+    lua_State* state = m_L;
+    const int baseline = lua_gettop(state);
+    int status = luaL_loadbuffer(state, buffer, length, name);
+    if (status == LUA_OK) status = lua_pcall(state, 0, LUA_MULTRET, 0);
+    CheckHealthy();
+    if (status != LUA_OK)
+    {
+        if (auto* error = static_cast<TaggedError*>(luaL_testudata(state, -1, ErrorMetatable)))
         {
-            // 发送错误文本
-            m_outputCb(err);
-            // 添加换行
-            m_outputCb("\n");
+            m_lastError.category = error->category;
+            lua_getiuservalue(state, -1, 1);
         }
-
-        // 弹出错误信息 恢复栈到基线
-        lua_settop(m_L, baseline);
+        const char* text = lua_tostring(state, -1);
+        std::string message = text ? text : "(non-string error object)";
+        int32_t line = -1;
+        if (m_lastError.category == protocol::ErrorCategory::Lua) StripLuaSourcePrefix(message, line);
+        m_lastError.line = includeLine && m_lastError.category == protocol::ErrorCategory::Lua ? line : -1;
+        m_lastError.message = std::move(message);
+        lua_settop(state, baseline);
         return false;
     }
-
-    // 执行成功 处理返回值
-    // 计算返回值数量 当前栈顶 - 基线
-    int nresults = lua_gettop(m_L) - baseline;
-
-    if (nresults > 0 && m_outputCb)
-    {
-        // 有返回值 自动回显
-        PrintReturnValues(m_L, nresults, m_outputCb);
-    }
-
-    // 恢复栈到基线（弹出所有返回值）
-    // 这确保每次执行后栈都回到初始状态 防止栈无限增长
-    lua_settop(m_L, baseline);
-
+    PrintReturnValues(state, lua_gettop(state) - baseline);
+    CheckHealthy();
+    lua_settop(state, baseline);
     return true;
 }
 
-// ============================================================
-// 执行 Lua 代码字符串
-// ============================================================
-bool LuaEngine::ExecuteString(const char* code)
+bool LuaEngine::ExecuteString(const char* code, size_t length)
 {
-    // 委托给 ExecuteBuffer
-    // 使用 strlen 计算长度 名称为 "<string>" 用于错误信息
-    if (code == nullptr) return false;
-
-    return ExecuteBuffer(code, strlen(code), "<string>");
+    // Unified Lune displays line numbers for files only.
+    return ExecuteBuffer(code, length, "=lune", false);
 }
 
-// ============================================================
-// 执行 Lua 文件
-// ============================================================
 bool LuaEngine::ExecuteFile(const char* path)
 {
-    // 前置检查
-    if (!m_initialized || path == nullptr) return false;
-
-    // 将路径转换为宽字符（支持 Unicode 路径）
-    // Lua 代码路径来自管道协议 可能是 UTF-8 或 ANSI 编码
-    // 使用 CP_UTF8 转换为 UTF-16 支持中文等非 ASCII 路径
-    wchar_t wpath[MAX_PATH];
-    int wlen = MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, MAX_PATH);
-    // 转换失败
-    if (wlen == 0)
-    {
-        // 可能是路径过长
-        if (m_outputCb) m_outputCb("[error] failed to convert file path to wide string\n");
+    if (IsFaulted()) return false;
+    auto error = [this](const char* message) {
+        SetLastError(protocol::ErrorCategory::Lua, -1, message);
         return false;
-    }
-
-    // 打开文件
-    // 使用 CreateFileW 打开文件 支持 Unicode 路径
-    HANDLE hFile = CreateFileW(wpath,                    // 文件路径
-                               GENERIC_READ,             // 只读访问
-                               FILE_SHARE_READ,          // 允许其他进程读取
-                               nullptr,                  // 默认安全属性
-                               OPEN_EXISTING,            // 文件必须存在
-                               FILE_ATTRIBUTE_NORMAL,    // 普通文件
-                               nullptr);                 // 无模板文件
-
-    // 文件打开失败
-    if (hFile == INVALID_HANDLE_VALUE)
+    };
+    if (!path || !*path) return error("Lua file path is empty");
+    const int length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, nullptr, 0);
+    if (length <= 0) return error("invalid UTF-8 file path");
+    std::vector<wchar_t> widePath(static_cast<size_t>(length));
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, widePath.data(), length) <= 0)
+        return error("failed to convert file path");
+    // Disk I/O runs outside the Lua mutex; ExecuteBuffer rechecks session state.
+    std::vector<char> source;
     {
-        if (m_outputCb)
-            m_outputCb("[error] cannot open file\n");
-        return false;
+        struct FileHandle
+        {
+            HANDLE value;
+            ~FileHandle()
+            {
+                if (value != INVALID_HANDLE_VALUE) CloseHandle(value);
+            }
+        } file{CreateFileW(widePath.data(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL, nullptr)};
+        if (file.value == INVALID_HANDLE_VALUE) return error("cannot open file");
+        LARGE_INTEGER size;
+        if (!GetFileSizeEx(file.value, &size) || size.QuadPart < 0) return error("cannot get file size");
+        if (size.QuadPart > 4 * 1024 * 1024) return error("file too large (max 4MB)");
+        source.resize(static_cast<size_t>(size.QuadPart));
+        size_t offset = 0;
+        while (offset < source.size())
+        {
+            DWORD read = 0;
+            if (!ReadFile(file.value, source.data() + offset, static_cast<DWORD>(source.size() - offset),
+                          &read, nullptr) ||
+                read == 0)
+                return error("failed to read complete file");
+            offset += read;
+        }
     }
-
-    // 获取文件大小
-    LARGE_INTEGER fileSize;
-    if (!GetFileSizeEx(hFile, &fileSize) || fileSize.QuadPart == 0)
-    {
-        // 无法获取文件大小或文件为空
-        CloseHandle(hFile);
-        if (m_outputCb) m_outputCb("[error] file is empty or cannot get size\n");
-        return false;
-    }
-
-    // 文件大小安全检查 限制为 4MB 防止读取过大文件
-    if (fileSize.QuadPart > static_cast<long long>(4 * 1024) * 1024)
-    {
-        CloseHandle(hFile);
-        if (m_outputCb) m_outputCb("[error] file too large (max 4MB)\n");
-        return false;
-    }
-
-    size_t srcSize = static_cast<size_t>(fileSize.QuadPart);
-
-    // 分配缓冲区并读取文件内容
-    // 多分配 1 字节用于零终止符（虽然 luaL_loadbuffer 不需要零终止 
-    // 但多分配一个字节更安全）
-    char* buffer = new (std::nothrow) char[srcSize + 1];
-    if (buffer == nullptr)
-    {
-        // 内存分配失败
-        CloseHandle(hFile);
-        if (m_outputCb) m_outputCb("[error] out of memory\n");
-        return false;
-    }
-
-    // 分块读取文件内容（ReadFile 可能不会一次读完大文件）
-    DWORD totalRead = 0;
-    while (totalRead < srcSize)
-    {
-        DWORD bytesRead = 0;
-        BOOL ok = ReadFile(hFile,
-                           buffer + totalRead,                      // 写入位置
-                           static_cast<DWORD>(srcSize - totalRead), // 读取量
-                           &bytesRead,                              // 实际读取量
-                           nullptr);                                // 同步 IO
-
-        // 读取结束或出错
-        if (!ok || bytesRead == 0) break;  
-
-        // 循环读取
-        totalRead += bytesRead;
-    }
-
-    // 关闭文件句柄（已读完内容）
-    CloseHandle(hFile);
-
-    // 零终止符（安全措施）
-    buffer[totalRead] = '\0';
-
-    // 执行文件内容
-    // 从路径中提取文件名作为代码块名称（用于错误信息）
-    // 例如 "C:\scripts\test.lua" → "test.lua"
     const char* name = path;
-    // Windows 路径分隔符
-    const char* lastSlash = strrchr(path, '\\');
-    if (lastSlash != nullptr) name = lastSlash + 1;
-    else
-    {
-        // 也检查正斜杠（兼容混合路径）
-        lastSlash = strrchr(path, '/');
-        if (lastSlash != nullptr) name = lastSlash + 1;
-    }
-
-    // 调用 ExecuteBuffer 执行文件内容
-    bool result = ExecuteBuffer(buffer, totalRead, name);
-
-    // 释放缓冲区
-    delete[] buffer;
-
-    return result;
+    for (const char* current = path; *current; ++current)
+        if (*current == '/' || *current == '\\') name = current + 1;
+    // '=' makes this a literal source name rather than Lua source text.
+    const std::string chunkName = std::string("=") + name;
+    return ExecuteBuffer(source.empty() ? "" : source.data(), source.size(), chunkName.c_str(), true);
 }
 
-// ============================================================
-// 自定义 print 函数
-// ============================================================
-// 替换 Lua 原生的 print 将输出重定向到管道通信层 
-// 行为与原生 print 一致：
-// print("hello", 42, true) → 输出 "hello\t42\ttrue\n"
-int LuaEngine::LuaPrint(lua_State* L)
+int LuaEngine::LuaPrint(lua_State* state)
 {
-    // 获取参数个数
-    int n = lua_gettop(L);
-
-    // 获取 LuaEngine 单例的输出回调
-    // 通过单例获取 因为 LuaPrint 是静态函数 无法直接访问成员变量
-    const OutputCallback& cb = Instance().m_outputCb;
-
-    // 如果没有设置输出回调 直接返回
-    if (!cb) return 0;
-
-    // 逐个处理参数 先拼接为完整字符串再一次性发送
-    // 避免多次调用 cb 导致多个 MSG_LOG 帧交错
-    std::string output;
-    for (int i = 1; i <= n; ++i)
+    const int count = lua_gettop(state);
+    luaL_Buffer buffer;
+    luaL_buffinit(state, &buffer);
+    for (int index = 1; index <= count; ++index)
     {
-        // 获取参数的字符串表示
-        // luaL_tolstring 对所有类型都能生成字符串描述
-        // 
-        // ·字符串/数字：直接返回值
-        // ·userdata：调用 __tostring 元方法
-        // ·table/无 __tostring 的类型：返回 "type: address" 格式
-        // 结果会推入栈顶 使用后需弹出
-        size_t len = 0;
-        const char* s = luaL_tolstring(L, i, &len);
-
-        if (s != nullptr)
-        {
-            output.append(s, len);
-        }
-        else
-        {
-            const char* typeName = luaL_typename(L, i);
-            output += (typeName ? typeName : "(unknown)");
-        }
-
-        // 弹出 luaL_tolstring 推入的结果
-        lua_pop(L, 1);
-
-        // 参数之间用制表符分隔（与原生 print 一致）
-        if (i < n) output += '\t';
+        luaL_tolstring(state, index, nullptr);
+        luaL_addvalue(&buffer);
+        if (index < count) luaL_addchar(&buffer, '\t');
     }
-
-    // 末尾添加换行符
-    output += '\n';
-
-    // 一次性发送完整输出（单个 MSG_LOG 帧）
-    cb(output.c_str());
-
-    // print 不返回值
+    luaL_addchar(&buffer, '\n');
+    luaL_pushresult(&buffer);
+    Instance().EmitOutput(lua_tostring(state, -1));
     return 0;
 }
 
-
-// ============================================================
-// 打印返回值（自动回显）
-// ============================================================
-// 在 lua_pcall 内执行 luaL_tolstring，使 userdata 的 __tostring 错误保持为普通
-// Lua 错误。直接在 ExecuteBuffer 的 pcall 结束后调用 luaL_tolstring，会让错误
-// 越过保护边界并终止承载 IPC 的工作线程。
-static int ProtectedToString(lua_State* L)
+void LuaEngine::PrintReturnValues(lua_State* state, int count)
 {
-    luaL_checkany(L, 1);
-    luaL_tolstring(L, 1, nullptr);
-    return 1;
-}
-
-// 执行完 Lua 代码后 如果栈上有返回值 逐个打印 
-// 每个返回值占一行 格式：值 (类型名)
-void LuaEngine::PrintReturnValues(lua_State* L, int count, const OutputCallback& outputCb)
-{
-    // 先拼接所有返回值为完整字符串 再一次性发送
-    // 避免多次调用 outputCb 导致多个 MSG_LOG 帧交错
-    std::string output;
-
-    // 使用绝对索引：luaL_tolstring 会向栈顶推入结果
-    // 负索引会因推入操作而偏移 必须用绝对索引
-    int base = lua_gettop(L) - count + 1;
-
-    for (int i = 0; i < count; ++i)
+    const int first = lua_gettop(state) - count + 1;
+    std::string text;
+    for (int index = first; index < first + count; ++index)
     {
-        int idx = base + i;
-        int type = lua_type(L, idx);
-
-        if (type == LUA_TNIL)
-        {
-            output += "nil\n";
-        }
-        else if (type == LUA_TBOOLEAN)
-        {
-            output += (lua_toboolean(L, idx) ? "true\n" : "false\n");
-        }
-        else
-        {
-            // tostring 可能调用用户数据的 __tostring 元方法，必须放在独立 pcall 中。
-            lua_pushcfunction(L, ProtectedToString);
-            lua_pushvalue(L, idx);
-            const int stringifyStatus = lua_pcall(L, 1, 1, 0);
-            if (stringifyStatus == LUA_OK)
-            {
-                size_t len = 0;
-                const char* text = lua_tolstring(L, -1, &len);
-                if (text != nullptr) output.append(text, len);
-                else output += "(" + std::string(lua_typename(L, type)) + ")";
-            }
-            else
-            {
-                size_t errorLength = 0;
-                const char* error = lua_tolstring(L, -1, &errorLength);
-                output += "<tostring error: ";
-                if (error != nullptr) output.append(error, errorLength);
-                else output += "unknown error";
-                output += '>';
-            }
-            output += '\n';
-
-            // 弹出 tostring 结果或 pcall 错误，原始返回值仍留在基线区域。
-            lua_pop(L, 1);
-        }
+        std::string value;
+        const bool success = LuaBridge_TryToString(state, index, value);
+        Instance().CheckHealthy();
+        text += success ? value : "<tostring error: " + value + ">";
+        text += '\n';
     }
-
-    // 一次性发送所有返回值（单个 MSG_LOG 帧）
-    if (!output.empty()) outputCb(output.c_str());
+    if (!text.empty()) Instance().EmitOutput(text.c_str());
 }

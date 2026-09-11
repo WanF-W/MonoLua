@@ -1,15 +1,12 @@
 /**
- * ============================================================
  * lua_bridge.h — Lua ↔ Mono 桥接层公共声明
- * ============================================================
  * 定义五类 userdata、metadata generation 和桥接注册入口。Binding 按
  * 初始化、全局入口、各 userdata、值转换和容器分别实现，避免形成单一
  * 巨型源文件。
  *
- * ·Assembly/Class/Method/Field 保存 Mono 元数据借用指针和 generation
- * ·Instance 保存强 GCHandle，不把可移动 MonoObject* 作为长期状态
+ * ·Assembly/Class/Method/Field 保存 Mono 元数据借用指针和 generation；校验只比较 generation
+ * ·Instance 保存强 GCHandle；显式刷新检测程序集移除后失效，不支持 Domain 热重载
  * ·所有公共操作通过独立元表暴露，命名与 Il2CppLua 保持一致
- * ============================================================
  */
 #pragma once
 #include "mono_runtime.h"
@@ -24,7 +21,7 @@ namespace LuaBridgeMT
     inline constexpr const char* INSTANCE = "MonoLua.Instance";
     inline constexpr const char* METHOD = "MonoLua.Method";
     inline constexpr const char* FIELD = "MonoLua.Field";
-}
+} // namespace LuaBridgeMT
 
 struct LuaAssemblyUD
 {
@@ -73,6 +70,10 @@ LuaMethodUD* LuaBridge_CheckMethod(lua_State* state, int index);
 void LuaBridge_PushField(lua_State* state, MonoClassField* field);
 LuaFieldUD* LuaBridge_CheckField(lua_State* state, int index);
 void LuaBridge_PushInstance(lua_State* state, MonoObject* object);
-void LuaBridge_PushInstanceHandle(lua_State* state, uint32_t handle);
+bool LuaBridge_TryPushInstance(lua_State* state, MonoObject* object, std::string& error);
+bool LuaBridge_TryToString(lua_State* state, int index, std::string& text);
+// Transfers ownership only after userdata initialization succeeds; clears the source handle.
+void LuaBridge_PushInstanceHandle(lua_State* state, uint32_t& handle);
 LuaInstanceUD* LuaBridge_CheckInstance(lua_State* state, int index);
+bool LuaBridge_TryGetInstanceObject(lua_State* state, int index, MonoObject*& object);
 MonoObject* LuaBridge_GetInstanceObject(lua_State* state, int index);

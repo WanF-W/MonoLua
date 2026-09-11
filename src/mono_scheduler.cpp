@@ -1,10 +1,7 @@
 /**
- * ============================================================
  * mono_scheduler.cpp — Unity 主线程任务队列实现
- * ============================================================
  * schedule 只建立 registry 引用并入队；内部 tick Hook 在首次进入的游戏
- * 线程上记录主线程身份，每帧交换队列后执行，回调中新排任务留到下一帧。
- * ============================================================
+ * 线程上记录主线程身份，每次 tick 交换队列后执行，回调中新排任务留到下一次非嵌套 tick。
  */
 #include "mono_scheduler.h"
 #include "mono_hook.h"
@@ -12,100 +9,137 @@
 #include "mono_resolver.h"
 #include "lua_engine.h"
 
-extern "C" {
+extern "C"
+{
 #include "lua.h"
 #include "lauxlib.h"
 }
 
 namespace
 {
+    constexpr size_t MAX_SCHEDULE_QUEUE = 1024;
     std::mutex g_mutex;
     std::vector<int> g_queue;
     MonoMethod* g_tick = nullptr;
     DWORD g_mainThread = 0;
-    bool g_ready = false;
-}
+    bool g_installFailureLogged = false;
+    thread_local bool g_draining = false;
+} // namespace
 
 bool MonoScheduler::Schedule(lua_State* state, int callbackIndex)
 {
+    std::lock_guard<std::recursive_mutex> luaLock(LuaEngine::Instance().GetMutex());
     if (!state || lua_type(state, callbackIndex) != LUA_TFUNCTION) return false;
     lua_pushvalue(state, callbackIndex);
     const int reference = luaL_ref(state, LUA_REGISTRYINDEX);
-    std::lock_guard<std::mutex> lock(g_mutex);
-    g_queue.push_back(reference);
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (g_queue.size() >= MAX_SCHEDULE_QUEUE)
+        {
+            luaL_unref(state, LUA_REGISTRYINDEX, reference);
+            return false;
+        }
+        g_queue.push_back(reference);
+    }
+    if (!IsReady())
+    {
+        std::string error;
+        if (!AutoSetTick(error) && !g_installFailureLogged)
+        {
+            g_installFailureLogged = true;
+            const std::string warning =
+                "[schedule] " + error + "; callbacks remain queued; use mono.set_tick().\n";
+            LuaEngine::Instance().EmitOutput(warning.c_str());
+        }
+    }
     return true;
 }
 
 bool MonoScheduler::SetTick(MonoMethod* method, std::string& error)
 {
-    if (!MonoHook::InstallTick(method, error)) return false;
+    std::lock_guard<std::recursive_mutex> luaLock(LuaEngine::Instance().GetMutex());
+    if (!MonoHook::InstallTick(method, OnTick, error)) return false;
     std::lock_guard<std::mutex> lock(g_mutex);
-    g_tick = method; g_mainThread = 0; g_ready = false;
+    g_tick = method;
+    g_mainThread = 0;
+    g_installFailureLogged = false;
     return true;
 }
 
 bool MonoScheduler::AutoSetTick(std::string& error)
 {
     error.clear();
-    MonoClass* time = MonoRuntime::Instance().FindClass("UnityEngine", "Time");
-    if (!time) { error = "UnityEngine.Time was not found"; return false; }
-    static constexpr const char* names[] = {
-        "get_frameCount", "get_deltaTime", "get_unscaledDeltaTime",
-        "get_time", "get_unscaledTime", "get_realtimeSinceStartup"
+    if (IsReady()) return true;
+    struct Candidate
+    {
+        const char* klass;
+        const char* method;
     };
+    static constexpr Candidate candidates[] = {
+        {"Time", "get_deltaTime"}, {"Time", "get_frameCount"}, {"Object", "get_name"}};
     auto& resolver = MonoResolver::Instance();
-    for (const char* name : names)
-        for (MonoMethod* method : resolver.EnumerateMethods(time))
+    for (const auto& candidate : candidates)
+    {
+        MonoClass* klass = MonoRuntime::Instance().FindClass("UnityEngine", candidate.klass);
+        if (!klass) continue;
+        for (MonoMethod* method : resolver.EnumerateMethods(klass))
         {
             const char* methodName = resolver.MethodName(method);
-            if (!methodName || strcmp(methodName, name) != 0 ||
-                (resolver.MethodFlags(method) & 0x0010) == 0 ||
-                !resolver.MethodParameters(method).empty()) continue;
+            if (!methodName || strcmp(methodName, candidate.method) != 0 ||
+                !resolver.MethodParameters(method).empty())
+                continue;
             if (SetTick(method, error)) return true;
         }
-    if (error.empty()) error = "no usable UnityEngine.Time tick method was found";
+    }
+    if (error.empty()) error = "no usable Unity tick method was found";
     return false;
 }
 
 MonoMethod* MonoScheduler::GetTick()
 {
-    std::lock_guard<std::mutex> lock(g_mutex); return g_tick;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return g_tick;
 }
 
 bool MonoScheduler::IsReady()
 {
-    std::lock_guard<std::mutex> lock(g_mutex); return g_ready;
-}
-
-bool MonoScheduler::IsMainThread()
-{
     std::lock_guard<std::mutex> lock(g_mutex);
-    return g_ready && g_mainThread == GetCurrentThreadId();
+    return g_tick != nullptr;
 }
 
 void MonoScheduler::OnTick()
 {
+    if (g_draining) return;
+    auto& engine = LuaEngine::Instance();
+    if (engine.IsFaulted()) return;
+    std::lock_guard<std::recursive_mutex> luaLock(engine.GetMutex());
+    lua_State* state = engine.GetState();
+    if (!state) return;
+    g_draining = true;
+    struct DrainGuard
+    {
+        ~DrainGuard() { g_draining = false; }
+    } guard;
     const DWORD thread = GetCurrentThreadId();
     std::vector<int> pending;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         if (!g_mainThread) g_mainThread = thread;
         if (g_mainThread != thread) return;
-        g_ready = true;
         pending.swap(g_queue);
     }
-    auto& engine = LuaEngine::Instance();
-    std::lock_guard<std::recursive_mutex> luaLock(engine.GetMutex());
-    lua_State* state = engine.GetState();
-    if (!state) return;
     for (int reference : pending)
     {
+        LuaEngine::OutputCapture outputCapture;
         lua_rawgeti(state, LUA_REGISTRYINDEX, reference);
-        if (lua_pcall(state, 0, 0, 0) != LUA_OK)
+        const int status = lua_pcall(state, 0, 0, 0);
+        engine.CheckHealthy();
+        if (status != LUA_OK)
         {
-            const char* message = lua_tostring(state, -1);
-            const OutputCallback& output = engine.GetOutputCallback();
-            if (output) output(message ? message : "[schedule] callback failed");
+            const std::string message = LuaEngine::ErrorText(state, -1);
+            const std::string error =
+                std::string("[schedule] ") + message + '\n';
+            engine.EmitOutput(error.c_str());
             lua_pop(state, 1);
         }
         luaL_unref(state, LUA_REGISTRYINDEX, reference);
@@ -114,15 +148,23 @@ void MonoScheduler::OnTick()
 
 void MonoScheduler::InvalidateMetadata()
 {
+    // 程序集快照已经失效，不能继续使用旧 tick；尚未交换出去的回调也不能
+    // 在没有新 tick 的情况下无限保留 registry 引用。调用方通常已经持有
+    // LuaEngine 锁，这里使用可重入锁兼容直接从 Lua API 触发的刷新。
+    auto& engine = LuaEngine::Instance();
+    if (engine.IsFaulted()) return;
+    std::lock_guard<std::recursive_mutex> luaLock(engine.GetMutex());
     std::lock_guard<std::mutex> lock(g_mutex);
+    if (lua_State* state = engine.GetState())
+        for (int reference : g_queue)
+            luaL_unref(state, LUA_REGISTRYINDEX, reference);
+    g_queue.clear();
     g_tick = nullptr;
     g_mainThread = 0;
-    g_ready = false;
+    g_installFailureLogged = false;
 }
 
-void MonoScheduler::Shutdown(lua_State* state)
+void MonoScheduler::Shutdown()
 {
-    std::lock_guard<std::mutex> lock(g_mutex);
-    if (state) for (int reference : g_queue) luaL_unref(state, LUA_REGISTRYINDEX, reference);
-    g_queue.clear(); g_tick = nullptr; g_mainThread = 0; g_ready = false;
+    InvalidateMetadata();
 }

@@ -19,13 +19,16 @@
     <ClCompile Include="src\lua_bridge_init.cpp"><Filter>cpp_src</Filter></ClCompile>
     <ClCompile Include="src\lua_container.cpp"><Filter>cpp_src</Filter></ClCompile>
     <ClCompile Include="src\lua_value.cpp"><Filter>cpp_src</Filter></ClCompile>
+    <ClCompile Include="src\lua_method_call.cpp"><Filter>cpp_src</Filter></ClCompile>
     <ClCompile Include="src\mono_hook.cpp"><Filter>cpp_src</Filter></ClCompile>
     <ClCompile Include="src\mono_scheduler.cpp"><Filter>cpp_src</Filter></ClCompile>
     <ClCompile Include="src\lua_userdata.cpp"><Filter>cpp_src</Filter></ClCompile>
     <ClCompile Include="src\lua_engine.cpp"><Filter>cpp_src</Filter></ClCompile>
     <ClCompile Include="src\mono_resolver.cpp"><Filter>cpp_src</Filter></ClCompile>
     <ClCompile Include="src\mono_runtime.cpp"><Filter>cpp_src</Filter></ClCompile>
+    <ClCompile Include="src\mono_session.cpp"><Filter>cpp_src</Filter></ClCompile>
     <ClCompile Include="src\pipe_channel.cpp"><Filter>cpp_src</Filter></ClCompile>
+    <ClCompile Include="src\unity_object_query.cpp"><Filter>cpp_src</Filter></ClCompile>
     <ClCompile Include="lua_src\lapi.c"><Filter>lua_src</Filter></ClCompile>
     <ClCompile Include="lua_src\lauxlib.c"><Filter>lua_src</Filter></ClCompile>
     <ClCompile Include="lua_src\lbaselib.c"><Filter>lua_src</Filter></ClCompile>
@@ -66,18 +69,25 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\common.h"><Filter>h_src</Filter></ClInclude>
+    <ClInclude Include="src\lua_cpp.h"><Filter>h_src</Filter></ClInclude>
+    <ClInclude Include="src\lua_dump.h"><Filter>h_src</Filter></ClInclude>
     <ClInclude Include="src\hook_stub.h"><Filter>h_src</Filter></ClInclude>
     <ClInclude Include="src\lua_bridge.h"><Filter>h_src</Filter></ClInclude>
     <ClInclude Include="src\lua_binding_internal.h"><Filter>h_src</Filter></ClInclude>
+    <ClInclude Include="src\lua_value_internal.h"><Filter>h_src</Filter></ClInclude>
     <ClInclude Include="src\lua_engine.h"><Filter>h_src</Filter></ClInclude>
     <ClInclude Include="src\mono_api.h"><Filter>h_src</Filter></ClInclude>
+    <ClInclude Include="src\mono_handle.h"><Filter>h_src</Filter></ClInclude>
+    <ClInclude Include="src\mono_metadata.h"><Filter>h_src</Filter></ClInclude>
     <ClInclude Include="src\mono_hook.h"><Filter>h_src</Filter></ClInclude>
     <ClInclude Include="src\mono_resolver.h"><Filter>h_src</Filter></ClInclude>
     <ClInclude Include="src\mono_runtime.h"><Filter>h_src</Filter></ClInclude>
+    <ClInclude Include="src\mono_session.h"><Filter>h_src</Filter></ClInclude>
     <ClInclude Include="src\mono_scheduler.h"><Filter>h_src</Filter></ClInclude>
     <ClInclude Include="src\pipe_channel.h"><Filter>h_src</Filter></ClInclude>
     <ClInclude Include="src\protocol.h"><Filter>h_src</Filter></ClInclude>
     <ClInclude Include="src\version.h"><Filter>h_src</Filter></ClInclude>
+    <ClInclude Include="src\unity_object_query.h"><Filter>h_src</Filter></ClInclude>
     <ClInclude Include="lua_src\lapi.h"><Filter>lua_src</Filter></ClInclude>
     <ClInclude Include="lua_src\lauxlib.h"><Filter>lua_src</Filter></ClInclude>
     <ClInclude Include="lua_src\lcode.h"><Filter>lua_src</Filter></ClInclude>
