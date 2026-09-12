@@ -126,9 +126,12 @@ namespace
     {
         // 状态查询只读取快照，不触发跨模块失效。
         std::string status = MonoRuntime::Instance().Status();
-        status += "\nTick hook: ";
+        // Keep the label consistent with il2cpp.get_status(); this is the
+        // scheduler/tick readiness state, while thread identity is confirmed
+        // by the independent probe.
+        status += "\nMain thread: ";
         status += MonoScheduler::IsReady() ? "ready" : "not ready";
-        status += "\nDropped log batches: " + std::to_string(PipeChannel::Instance().DroppedLogs());
+        status += "\nRejected log batches: " + std::to_string(PipeChannel::Instance().DroppedLogs());
         lua_pushlstring(state, status.data(), status.size());
         return 1;
     }

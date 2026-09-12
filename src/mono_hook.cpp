@@ -52,6 +52,7 @@ namespace
         uint32_t id = 0;
         int luaRef = LUA_REFNIL;
         bool enabled = false;
+        void (*probeCallback)() = nullptr;
         void (*tickCallback)() = nullptr;
         bool isStatic = false;
         std::vector<MonoType*> parameters;
@@ -82,6 +83,8 @@ namespace
     std::vector<int> g_deferredLuaRefs;
     bool g_metadataCleanupPending = false;
     HookEntry* g_tickEntry = nullptr;
+    HookEntry* g_probeEntry = nullptr;
+    thread_local unsigned g_dispatchDepth = 0;
     thread_local HookEntry* g_bypassEntry = nullptr;
     thread_local OriginalState* g_currentOriginal = nullptr;
     uint64_t g_nextOriginalToken = 0; // protected by the Lua mutex
@@ -188,20 +191,44 @@ namespace
             error = "method has an unsupported return type";
             return false;
         }
-        entry.target = resolver.CompileMethod(method);
+        const bool internalCall =
+            (resolver.MethodImplementationFlags(method) & METHOD_IMPL_ATTRIBUTE_INTERNAL_CALL) != 0;
+        if (internalCall)
+        {
+            // Native bindings may marshal objects/structs or carry hidden arguments.
+            // Parameterless scalar Unity Time getters have a stable Windows x64 ABI:
+            // the return value is in the integer/XMM return register and there are no
+            // hidden object or RGCTX arguments.
+            const char* ns = resolver.ClassNamespace(klass);
+            const char* name = resolver.ClassName(klass);
+            const char* methodName = resolver.MethodName(method);
+            const int kind = resolver.TypeKind(entry.returnType);
+            if (!entry.isStatic || !entry.parameters.empty() || !ns || !name || !methodName ||
+                strcmp(ns, "UnityEngine") != 0 || strcmp(name, "Time") != 0 ||
+                !((kind >= TYPE_BOOLEAN && kind <= TYPE_R8) || kind == TYPE_I || kind == TYPE_U))
+            {
+                error = "failed to prepare native hook: unsupported InternalCall ABI";
+                return false;
+            }
+            entry.target = resolver.LookupInternalCall(method);
+        }
+        else entry.target = resolver.CompileMethod(method);
         if (!entry.target)
         {
-            error = "failed to prepare native hook";
+            error = internalCall
+                        ? "failed to prepare native hook: internal call target is unavailable (mono_lookup_internal_call)"
+                        : "failed to prepare native hook: failed to compile method";
             return false;
         }
         return true;
     }
 
-    bool EnsureMinHook()
+    bool EnsureMinHook(std::string& error)
     {
         if (g_minHookReady) return true;
         const MH_STATUS status = MH_Initialize();
         g_minHookReady = status == MH_OK || status == MH_ERROR_ALREADY_INITIALIZED;
+        if (!g_minHookReady) error = std::string("native hook initialization failed: ") + MH_StatusToString(status);
         return g_minHookReady;
     }
 
@@ -236,7 +263,9 @@ namespace
             if (created == MH_OK) MH_RemoveHook(entry.target);
             VirtualFree(entry.thunk, 0, MEM_RELEASE);
             entry.thunk = nullptr;
-            error = "failed to install native hook";
+            error = std::string("native hook failed: create=") + MH_StatusToString(created) +
+                    ", enable=" + (created == MH_OK ? MH_StatusToString(enabled) : "not attempted") +
+                    " (failed to install native hook)";
             return false;
         }
         entry.enabled = true;
@@ -565,10 +594,24 @@ namespace
             std::lock_guard<std::mutex> lock(g_mutex);
             if (context->hookId < g_entries.size())
             {
-                const auto* entry = g_entries[context->hookId].get();
+                auto* entry = g_entries[context->hookId].get();
                 if (entry && entry->enabled && entry != g_bypassEntry && !g_shutdown.load())
                 {
-                    tick = entry->tickCallback;
+                    if (entry->probeCallback && g_dispatchDepth == 1 &&
+                        bridge_lifecycle::g_managedCallDepth == 0 && !LuaEngine::Instance().IsFaulted())
+                    {
+                        // The callback only performs an atomic identity bind; no Lua or Hook locks.
+                        entry->probeCallback();
+                        entry->probeCallback = nullptr;
+                        g_probeEntry = nullptr;
+                        if (!entry->tickCallback && entry->luaRef == LUA_REFNIL)
+                        {
+                            const MH_STATUS status = MH_DisableHook(entry->target);
+                            if (status == MH_OK || status == MH_ERROR_DISABLED) entry->enabled = false;
+                        }
+                    }
+                    if (g_dispatchDepth == 1 && bridge_lifecycle::g_managedCallDepth == 0)
+                        tick = entry->tickCallback;
                     returnType = entry->returnType;
                 }
             }
@@ -600,6 +643,9 @@ namespace
 
 extern "C" void HookDispatch(NativeHookContext* context)
 {
+    const unsigned previousDepth = g_dispatchDepth;
+    const unsigned previousManagedDepth = bridge_lifecycle::g_managedCallDepth;
+    ++g_dispatchDepth;
     OriginalState* previousOriginal = g_currentOriginal;
     HookEntry* previousBypass = g_bypassEntry;
     __try
@@ -614,6 +660,8 @@ extern "C" void HookDispatch(NativeHookContext* context)
         g_bypassEntry = previousBypass;
         if (context) context->original = nullptr;
     }
+    g_dispatchDepth = previousDepth;
+    bridge_lifecycle::g_managedCallDepth = previousManagedDepth;
 }
 
 bool MonoHook::HookMethod(lua_State* state, MonoMethod* method, int callbackIndex, std::string& error)
@@ -638,11 +686,7 @@ bool MonoHook::HookMethod(lua_State* state, MonoMethod* method, int callbackInde
     std::lock_guard<std::mutex> lock(g_mutex);
     // MinHook 的全局状态与本模块的 Hook 表必须使用同一串行化边界；否则
     // 命令线程和 Hook 回调线程同时注册方法时可能并发初始化 MinHook。
-    if (!EnsureMinHook())
-    {
-        error = "failed to prepare native hook";
-        return false;
-    }
+    if (!EnsureMinHook(error)) return false;
     if (g_metadataCleanupPending)
     {
         error = "metadata invalidation is still waiting for active hooks";
@@ -661,7 +705,7 @@ bool MonoHook::HookMethod(lua_State* state, MonoMethod* method, int callbackInde
         if (status != MH_OK && status != MH_ERROR_ENABLED)
         {
             luaL_unref(state, LUA_REGISTRYINDEX, reference);
-            error = "failed to re-enable method hook";
+            error = std::string("failed to re-enable method hook: ") + MH_StatusToString(status);
             return false;
         }
         QueueLuaRefLocked(entry->luaRef);
@@ -704,7 +748,7 @@ bool MonoHook::UnhookMethod(MonoMethod* method)
         HookEntry* entry = found->second;
         QueueLuaRefLocked(entry->luaRef);
         entry->luaRef = LUA_REFNIL;
-        if (!entry->tickCallback)
+        if (!entry->tickCallback && !entry->probeCallback)
         {
             MH_DisableHook(entry->target);
             entry->enabled = false;
@@ -723,12 +767,12 @@ bool MonoHook::IsHooked(MonoMethod* method)
     return found != g_methods.end() && found->second->enabled && found->second->luaRef != LUA_REFNIL;
 }
 
-bool MonoHook::InstallTick(MonoMethod* method, void (*callback)(), std::string& error)
+static bool InstallInternalHook(MonoMethod* method, void (*callback)(), bool probe, std::string& error)
 {
     error.clear();
     if (!method || !callback)
     {
-        error = "tick method is null";
+        error = "internal hook requires a method and callback";
         return false;
     }
     if (g_shutdown.load())
@@ -736,53 +780,52 @@ bool MonoHook::InstallTick(MonoMethod* method, void (*callback)(), std::string& 
         error = "hook manager has already been shut down";
         return false;
     }
-    DrainDeferred();
+    MonoHook::DrainDeferred();
     HookEntry prepared;
     if (!PrepareHook(method, prepared, error)) return false;
     void* target = prepared.target;
     std::lock_guard<std::mutex> lock(g_mutex);
-    if (!EnsureMinHook())
-    {
-        error = "failed to prepare tick hook";
-        return false;
-    }
+    if (!EnsureMinHook(error)) return false;
     if (g_metadataCleanupPending)
     {
         error = "metadata invalidation is still waiting for active hooks";
         return false;
     }
 
-    // Commit the new tick only after its hook is enabled.
-    const auto commitTick = [callback](HookEntry* next) {
-        if (g_tickEntry && g_tickEntry != next)
+    // Commit the selected role only after its hook is enabled.
+    const auto commitRole = [callback, probe](HookEntry* next) {
+        HookEntry*& current = probe ? g_probeEntry : g_tickEntry;
+        if (current && current != next)
         {
-            g_tickEntry->tickCallback = nullptr;
-            if (g_tickEntry->luaRef == LUA_REFNIL)
+            if (probe) current->probeCallback = nullptr;
+            else current->tickCallback = nullptr;
+            if (current->luaRef == LUA_REFNIL && !current->tickCallback && !current->probeCallback)
             {
-                MH_DisableHook(g_tickEntry->target);
-                g_tickEntry->enabled = false;
+                MH_DisableHook(current->target);
+                current->enabled = false;
             }
         }
-        next->tickCallback = callback;
+        if (probe) next->probeCallback = callback;
+        else next->tickCallback = callback;
         next->enabled = true;
-        g_tickEntry = next;
+        current = next;
     };
     for (auto& item : g_entries)
     {
         if (!item || item->target != target) continue;
         if (item->method != method)
         {
-            error = "tick method shares its native address with another registered Mono method";
+            error = "internal hook method shares its native address with another registered Mono method";
             return false;
         }
         g_methods[method] = item.get();
         const MH_STATUS status = MH_EnableHook(target);
         if (status != MH_OK && status != MH_ERROR_ENABLED)
         {
-            error = "failed to enable tick hook";
+            error = std::string("failed to enable internal hook: ") + MH_StatusToString(status);
             return false;
         }
-        commitTick(item.get());
+        commitRole(item.get());
         return true;
     }
     auto entry = std::make_unique<HookEntry>(std::move(prepared));
@@ -791,10 +834,20 @@ bool MonoHook::InstallTick(MonoMethod* method, void (*callback)(), std::string& 
     {
         return false;
     }
-    commitTick(entry.get());
+    commitRole(entry.get());
     g_methods[method] = entry.get();
     g_entries.push_back(std::move(entry));
     return true;
+}
+
+bool MonoHook::InstallTick(MonoMethod* method, void (*callback)(), std::string& error)
+{
+    return InstallInternalHook(method, callback, false, error);
+}
+
+bool MonoHook::InstallMainThreadProbe(MonoMethod* method, void (*callback)(), std::string& error)
+{
+    return InstallInternalHook(method, callback, true, error);
 }
 
 void MonoHook::UnhookAll()
@@ -806,7 +859,7 @@ void MonoHook::UnhookAll()
             if (!entry || entry->luaRef == LUA_REFNIL) continue;
             QueueLuaRefLocked(entry->luaRef);
             entry->luaRef = LUA_REFNIL;
-            if (!entry->tickCallback)
+            if (!entry->tickCallback && !entry->probeCallback)
             {
                 MH_DisableHook(entry->target);
                 entry->enabled = false;
@@ -828,9 +881,11 @@ void MonoHook::InvalidateMetadata()
             entry->luaRef = LUA_REFNIL;
             entry->enabled = false;
             entry->tickCallback = nullptr;
+            entry->probeCallback = nullptr;
         }
         g_methods.clear();
         g_tickEntry = nullptr;
+        g_probeEntry = nullptr;
         g_metadataCleanupPending = true;
     }
     // 不能在仍有 Hook 回调时释放 trampoline 或 Lua 引用。若当前就在
@@ -858,6 +913,7 @@ void MonoHook::DrainDeferred()
         g_entries.clear();
         g_methods.clear();
         g_tickEntry = nullptr;
+        g_probeEntry = nullptr;
         g_metadataCleanupPending = false;
     }
     for (int reference : g_deferredLuaRefs)
@@ -899,6 +955,7 @@ void MonoHook::Shutdown()
     g_entries.clear();
     g_methods.clear();
     g_tickEntry = nullptr;
+    g_probeEntry = nullptr;
     g_metadataCleanupPending = false;
     for (int reference : g_deferredLuaRefs)
         if (state) luaL_unref(state, LUA_REGISTRYINDEX, reference);

@@ -204,6 +204,7 @@ void LuaEngine::Shutdown()
 
 bool LuaEngine::ExecuteBuffer(const char* buffer, size_t length, const char* name, bool includeLine)
 {
+    bridge_lifecycle::ManagedCallScope callScope;
     if (IsFaulted()) return false;
     std::lock_guard<std::recursive_mutex> lock(m_luaMutex);
     if (IsFaulted()) return false;

@@ -261,10 +261,15 @@ bool MonoRuntime::InspectOpenMethod(MonoMethod* method, bool& containsGenericPar
 std::string MonoRuntime::Status() const
 {
     const auto& resolver = MonoResolver::Instance();
+    const auto assemblies = Assemblies();
+    size_t imageCount = 0;
+    for (const auto& assembly : assemblies)
+        if (assembly.image) ++imageCount;
     std::ostringstream output;
     output << "Initialized: " << (m_initialized.load() ? "true" : "false") << '\n';
     output << "Exports: " << resolver.ResolveStatus() << '\n';
-    output << "Assemblies: " << Assemblies().size() << '\n';
+    output << "Assemblies: " << assemblies.size() << '\n';
+    output << "Images: " << imageCount << '\n';
     output << "Root domain: 0x" << std::uppercase << std::hex
            << reinterpret_cast<uintptr_t>(resolver.RootDomain()) << '\n';
     output << "Worker domain: 0x" << std::uppercase << std::hex

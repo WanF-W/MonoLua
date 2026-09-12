@@ -53,6 +53,8 @@ class MonoResolver
     std::vector<MonoType*> MethodParameters(MonoMethod* method) const;
     MonoType* MethodReturnType(MonoMethod* method) const;
     uint32_t MethodFlags(MonoMethod* method) const;
+    uint32_t MethodImplementationFlags(MonoMethod* method) const;
+    void* LookupInternalCall(MonoMethod* method) const;
     bool MethodIsGeneric(MonoMethod* method) const;
     bool CanInspectGenericMethods() const { return m_methodIsGeneric && m_methodIsInflated; }
     MonoObject* MethodObject(MonoDomain* domain, MonoMethod* method) const;
@@ -166,6 +168,7 @@ class MonoResolver
     using FnObjectUnbox = void* (*)(MonoObject*);
     using FnObjectToString = MonoString* (*)(MonoObject*, MonoObject**);
     using FnCompileMethod = void* (*)(MonoMethod*);
+    using FnLookupInternalCall = void* (*)(MonoMethod*);
     using FnArrayLength = uintptr_t (*)(MonoArray*);
     using FnArrayAddrWithSize = char* (*)(MonoArray*, int, uintptr_t);
     using FnObjectNew = MonoObject* (*)(MonoDomain*, MonoClass*);
@@ -249,6 +252,7 @@ class MonoResolver
     FnObjectUnbox m_objectUnbox = nullptr;
     FnObjectToString m_objectToString = nullptr;
     FnCompileMethod m_compileMethod = nullptr;
+    FnLookupInternalCall m_lookupInternalCall = nullptr;
     FnArrayLength m_arrayLength = nullptr;
     FnArrayAddrWithSize m_arrayAddrWithSize = nullptr;
     FnObjectNew m_objectNew = nullptr;

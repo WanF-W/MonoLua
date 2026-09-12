@@ -12,6 +12,7 @@
 namespace mono_metadata
 {
     constexpr uint32_t METHOD_ATTRIBUTE_STATIC = 0x0010;
+    constexpr uint32_t METHOD_IMPL_ATTRIBUTE_INTERNAL_CALL = 0x1000;
 
     constexpr uint32_t FIELD_ATTRIBUTE_STATIC = 0x0010;
     constexpr uint32_t FIELD_ATTRIBUTE_INIT_ONLY = 0x0020;

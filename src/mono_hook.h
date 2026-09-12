@@ -17,6 +17,7 @@ namespace MonoHook
     bool IsHooked(MonoMethod* method);
     // The caller owns scheduling policy; Hook only invokes the supplied tick callback.
     bool InstallTick(MonoMethod* method, void (*callback)(), std::string& error);
+    bool InstallMainThreadProbe(MonoMethod* method, void (*callback)(), std::string& error);
     void UnhookAll();
     void InvalidateMetadata();
     void DrainDeferred();

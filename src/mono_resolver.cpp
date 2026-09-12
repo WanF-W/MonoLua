@@ -197,6 +197,7 @@ bool MonoResolver::ResolveExports()
     ok &= required(m_objectUnbox, "mono_object_unbox");
     optional(m_objectToString, "mono_object_to_string");
     optional(m_compileMethod, "mono_compile_method");
+    optional(m_lookupInternalCall, "mono_lookup_internal_call");
     optional(m_arrayLength, "mono_array_length");
     optional(m_arrayAddrWithSize, "mono_array_addr_with_size");
     optional(m_objectNew, "mono_object_new");
@@ -286,6 +287,7 @@ void MonoResolver::Shutdown()
     m_objectUnbox = nullptr;
     m_objectToString = nullptr;
     m_compileMethod = nullptr;
+    m_lookupInternalCall = nullptr;
     m_arrayLength = nullptr;
     m_arrayAddrWithSize = nullptr;
     m_objectNew = nullptr;
@@ -526,6 +528,7 @@ MonoObject* MonoResolver::MethodObject(MonoDomain* domain, MonoMethod* method) c
 MonoObject* MonoResolver::Invoke(MonoMethod* method, void* object, void** parameters,
                                  MonoObject** exception) const
 {
+    bridge_lifecycle::ManagedCallScope callScope;
     MonoObject* result = m_runtimeInvoke && method ? m_runtimeInvoke(method, object, parameters, exception) : nullptr;
     // A nested detour can quarantine the VM while runtime_invoke is in flight.
     // Propagate before callers perform reflection, root allocation or Lua error handling.
@@ -562,6 +565,18 @@ std::string MonoResolver::ObjectString(MonoObject* object) const
 void* MonoResolver::CompileMethod(MonoMethod* method) const
 {
     return m_compileMethod && method ? m_compileMethod(method) : nullptr;
+}
+
+uint32_t MonoResolver::MethodImplementationFlags(MonoMethod* method) const
+{
+    uint32_t flags = 0;
+    if (m_methodGetFlags && method) m_methodGetFlags(method, &flags);
+    return flags;
+}
+
+void* MonoResolver::LookupInternalCall(MonoMethod* method) const
+{
+    return m_lookupInternalCall && method ? m_lookupInternalCall(method) : nullptr;
 }
 
 uintptr_t MonoResolver::ArrayLength(MonoArray* array) const
