@@ -10,6 +10,8 @@
 #include "lua_engine.h"
 #include "lua_value_internal.h"
 #include "mono_handle.h"
+#include "mono_feature_fault.h"
+#include "mono_scheduler_candidates.h"
 #include "../minhook_src/MinHook.h"
 #include <memory>
 
@@ -89,6 +91,31 @@ namespace
     thread_local OriginalState* g_currentOriginal = nullptr;
     uint64_t g_nextOriginalToken = 0; // protected by the Lua mutex
 
+    // 调用方持有 g_mutex。若在创建可执行资源前发生 Lua 分配或普通设置失败，
+    // 撤销容器登记。
+    struct PendingRegistration
+    {
+        HookEntry* entry;
+        ~PendingRegistration()
+        {
+            if (bridge_lifecycle::g_sessionFaulted.load() || entry->enabled || entry->luaRef != LUA_REFNIL ||
+                entry->probeCallback || entry->tickCallback)
+                return;
+            if (entry->thunk)
+            {
+                const MH_STATUS removed = MH_RemoveHook(entry->target);
+                if (removed != MH_OK && removed != MH_ERROR_NOT_CREATED) return;
+                VirtualFree(entry->thunk, 0, MEM_RELEASE);
+                entry->thunk = nullptr;
+            }
+            if (!g_entries.empty() && g_entries.back().get() == entry)
+            {
+                g_methods.erase(entry->method);
+                g_entries.pop_back();
+            }
+        }
+    };
+
     bool HookStubsActive()
     {
         return InterlockedCompareExchange64(const_cast<LONGLONG*>(&g_hookStubUsers), 0, 0) != 0;
@@ -151,30 +178,81 @@ namespace
                kind == TYPE_I || kind == TYPE_U || kind == TYPE_OBJECT || kind == TYPE_SZARRAY;
     }
 
-    bool PrepareHook(MonoMethod* method, HookEntry& entry, std::string& error)
+    bool InspectHookMetadata(MonoMethod* method, HookEntry& entry, std::string& error, bool& internalCall,
+                             const MonoScheduler::Candidate* candidate, MonoFeatureFault& fault)
     {
         auto& resolver = MonoResolver::Instance();
+        fault.stage = "hook metadata: method declaring class";
         MonoClass* klass = resolver.MethodClass(method);
+        fault.stage = "hook metadata: declaring class value type";
         if (!klass || resolver.ClassIsValueType(klass))
         {
             error = "hooking methods declared by value types is not supported";
             return false;
         }
-        bool isGeneric = false;
-        if (!MonoRuntime::Instance().InspectMethodGenerics(method, isGeneric))
-        {
-            error = "failed to inspect this method's generic calling convention";
-            return false;
-        }
-        if (isGeneric)
-        {
-            error = "hooking generic or inflated methods is not supported";
-            return false;
-        }
         entry.method = method;
+        fault.stage = "hook metadata: parameter signature";
         entry.parameters = resolver.MethodParameters(method);
+        fault.stage = "hook metadata: return signature";
         entry.returnType = resolver.MethodReturnType(method);
+        fault.stage = "hook metadata: method flags";
         entry.isStatic = (resolver.MethodFlags(method) & METHOD_ATTRIBUTE_STATIC) != 0;
+        if (candidate)
+        {
+            // 只有调度器内置描述可以直接确定入口不是泛型方法；
+            // 不检查程序集文件名，也不要求无关的实现标志。
+            if (candidate != &MonoScheduler::ExecuteTasks && candidate != &MonoScheduler::DeltaTime &&
+                candidate != &MonoScheduler::FrameCount && candidate != &MonoScheduler::ObjectName)
+            {
+                error = "unknown built-in scheduler candidate";
+                return false;
+            }
+            fault.stage = "hook metadata: scheduler method identity";
+            const char* className = resolver.ClassName(klass);
+            const char* methodName = resolver.MethodName(method);
+            // FindClass 已经按 UnityEngine 命名空间解析了声明类，
+            // 不再读取一份在不同 Unity Mono 分支中可能不稳定的命名空间数据。
+            if (!className || !methodName ||
+                strcmp(className, candidate->klass) != 0 || strcmp(methodName, candidate->method) != 0)
+            {
+                error = "resolved method does not match the scheduler candidate";
+                return false;
+            }
+            fault.stage = "hook metadata: scheduler calling convention";
+            if (entry.isStatic != candidate->isStatic)
+            {
+                error = candidate->isStatic ? "scheduler candidate must be static" : "scheduler candidate must be an instance method";
+                return false;
+            }
+            if (!entry.parameters.empty())
+            {
+                error = "scheduler candidate has " + std::to_string(entry.parameters.size()) + " parameters; expected 0";
+                return false;
+            }
+            if (!entry.returnType || resolver.TypeIsByRef(entry.returnType))
+            {
+                error = "scheduler return signature is missing or by-reference";
+                return false;
+            }
+            const int actualKind = resolver.TypeKind(entry.returnType);
+            if (actualKind != candidate->returnKind)
+            {
+                error = "scheduler return kind " + std::to_string(actualKind) +
+                        "; expected " + std::to_string(candidate->returnKind);
+                return false;
+            }
+        }
+        else
+        {
+            const auto kind = MonoRuntime::Instance().InspectMethodGenerics(method, error);
+            if (kind == MonoRuntime::GenericMethodKind::Unknown) return false;
+            if (kind == MonoRuntime::GenericMethodKind::Generic)
+            {
+                error = "hooking generic methods or methods on generic types is not supported";
+                return false;
+            }
+        }
+        fault.stage = "hook metadata: parameter ABI";
         if (entry.parameters.size() > 64)
         {
             error = "hook supports at most 64 parameters";
@@ -186,33 +264,67 @@ namespace
                 error = "method contains an unsupported parameter type";
                 return false;
             }
+        fault.stage = "hook metadata: return ABI";
         if (!IsSupported(entry.returnType, true))
         {
             error = "method has an unsupported return type";
             return false;
         }
-        const bool internalCall =
+        fault.stage = "hook metadata: implementation flags";
+        internalCall =
             (resolver.MethodImplementationFlags(method) & METHOD_IMPL_ATTRIBUTE_INTERNAL_CALL) != 0;
         if (internalCall)
         {
-            // Native bindings may marshal objects/structs or carry hidden arguments.
-            // Parameterless scalar Unity Time getters have a stable Windows x64 ABI:
-            // the return value is in the integer/XMM return register and there are no
-            // hidden object or RGCTX arguments.
-            const char* ns = resolver.ClassNamespace(klass);
-            const char* name = resolver.ClassName(klass);
-            const char* methodName = resolver.MethodName(method);
+            fault.stage = "hook metadata: InternalCall ABI";
+            // 调度器固定描述已经确定完整的 Windows x64 形状，
+            // 也包含实例 getter 的隐含 this 槽位。固定路径不再读取命名空间或
+            // 反射信息；任意用户 InternalCall 仍限制为 UnityEngine.Time 的
+            // 静态标量 ABI。
             const int kind = resolver.TypeKind(entry.returnType);
-            if (!entry.isStatic || !entry.parameters.empty() || !ns || !name || !methodName ||
-                strcmp(ns, "UnityEngine") != 0 || strcmp(name, "Time") != 0 ||
-                !((kind >= TYPE_BOOLEAN && kind <= TYPE_R8) || kind == TYPE_I || kind == TYPE_U))
+            bool supportedInternalCall = false;
+            if (candidate)
+                supportedInternalCall = entry.isStatic == candidate->isStatic &&
+                    entry.parameters.empty() && kind == candidate->returnKind;
+            else
+            {
+                const char* ns = resolver.ClassNamespace(klass);
+                const char* name = resolver.ClassName(klass);
+                const char* methodName = resolver.MethodName(method);
+                supportedInternalCall = entry.isStatic && entry.parameters.empty() && ns && name && methodName &&
+                    strcmp(ns, "UnityEngine") == 0 && strcmp(name, "Time") == 0 &&
+                    ((kind >= TYPE_BOOLEAN && kind <= TYPE_R8) || kind == TYPE_I || kind == TYPE_U);
+            }
+            if (!supportedInternalCall)
             {
                 error = "failed to prepare native hook: unsupported InternalCall ABI";
                 return false;
             }
-            entry.target = resolver.LookupInternalCall(method);
         }
-        else entry.target = resolver.CompileMethod(method);
+        return true;
+    }
+
+    bool InspectMetadataSafely(MonoMethod* method, HookEntry& entry, std::string& error, bool& internalCall,
+                               const MonoScheduler::Candidate* candidate)
+    {
+        MonoFeatureFault fault;
+        __try
+        {
+            return InspectHookMetadata(method, entry, error, internalCall, candidate, fault);
+        }
+        __except (fault.Filter(GetExceptionInformation()))
+        {
+        }
+        fault.Describe(fault.stage, error);
+        return false;
+    }
+
+    bool PrepareHook(MonoMethod* method, HookEntry& entry, std::string& error,
+                     const MonoScheduler::Candidate* candidate = nullptr)
+    {
+        bool internalCall = false;
+        if (!InspectMetadataSafely(method, entry, error, internalCall, candidate)) return false;
+        auto& resolver = MonoResolver::Instance();
+        entry.target = internalCall ? resolver.LookupInternalCall(method) : resolver.CompileMethod(method);
         if (!entry.target)
         {
             error = internalCall
@@ -260,12 +372,23 @@ namespace
         const MH_STATUS enabled = created == MH_OK ? MH_EnableHook(entry.target) : MH_UNKNOWN;
         if (created != MH_OK || enabled != MH_OK)
         {
-            if (created == MH_OK) MH_RemoveHook(entry.target);
-            VirtualFree(entry.thunk, 0, MEM_RELEASE);
-            entry.thunk = nullptr;
             error = std::string("native hook failed: create=") + MH_StatusToString(created) +
                     ", enable=" + (created == MH_OK ? MH_StatusToString(enabled) : "not attempted") +
                     " (failed to install native hook)";
+            if (created == MH_OK)
+            {
+                const MH_STATUS removed = MH_RemoveHook(entry.target);
+                if (removed != MH_OK && removed != MH_ERROR_NOT_CREATED)
+                {
+                    // 管理器已经拥有该条目。如果 MinHook 仍可能引用这段代码，
+                    // 保留可执行内存，退出时再重试清理。
+                    entry.enabled = true;
+                    error += std::string("; rollback remove failed: ") + MH_StatusToString(removed);
+                    return false;
+                }
+            }
+            VirtualFree(entry.thunk, 0, MEM_RELEASE);
+            entry.thunk = nullptr;
             return false;
         }
         entry.enabled = true;
@@ -727,14 +850,21 @@ bool MonoHook::HookMethod(lua_State* state, MonoMethod* method, int callbackInde
     auto entry = std::make_unique<HookEntry>(std::move(prepared));
     entry->id = static_cast<uint32_t>(g_entries.size());
     lua_pushvalue(state, callbackIndex);
-    entry->luaRef = luaL_ref(state, LUA_REGISTRYINDEX);
-    if (!EnableNativeHook(*entry, error))
+    const int reference = luaL_ref(state, LUA_REGISTRYINDEX);
+    entry->luaRef = reference;
+    // Lua 引用成功后再登记条目。若 luaL_ref 因 Lua 分配失败抛出异常，
+    // 不留下半登记的原生条目。
+    g_entries.reserve(g_entries.size() + 1);
+    HookEntry* next = entry.get();
+    g_methods.emplace(method, next);
+    g_entries.push_back(std::move(entry));
+    PendingRegistration registration{next};
+    if (!EnableNativeHook(*next, error))
     {
-        luaL_unref(state, LUA_REGISTRYINDEX, entry->luaRef);
+        luaL_unref(state, LUA_REGISTRYINDEX, next->luaRef);
+        next->luaRef = LUA_REFNIL;
         return false;
     }
-    g_methods[method] = entry.get();
-    g_entries.push_back(std::move(entry));
     return true;
 }
 
@@ -767,7 +897,8 @@ bool MonoHook::IsHooked(MonoMethod* method)
     return found != g_methods.end() && found->second->enabled && found->second->luaRef != LUA_REFNIL;
 }
 
-static bool InstallInternalHook(MonoMethod* method, void (*callback)(), bool probe, std::string& error)
+static bool InstallInternalHook(MonoMethod* method, void (*callback)(), bool probe, std::string& error,
+                                const MonoScheduler::Candidate* candidate = nullptr)
 {
     error.clear();
     if (!method || !callback)
@@ -782,7 +913,7 @@ static bool InstallInternalHook(MonoMethod* method, void (*callback)(), bool pro
     }
     MonoHook::DrainDeferred();
     HookEntry prepared;
-    if (!PrepareHook(method, prepared, error)) return false;
+    if (!PrepareHook(method, prepared, error, candidate)) return false;
     void* target = prepared.target;
     std::lock_guard<std::mutex> lock(g_mutex);
     if (!EnsureMinHook(error)) return false;
@@ -793,22 +924,35 @@ static bool InstallInternalHook(MonoMethod* method, void (*callback)(), bool pro
     }
 
     // Commit the selected role only after its hook is enabled.
-    const auto commitRole = [callback, probe](HookEntry* next) {
+    const auto commitRole = [callback, probe, &error](HookEntry* next) {
         HookEntry*& current = probe ? g_probeEntry : g_tickEntry;
         if (current && current != next)
         {
-            if (probe) current->probeCallback = nullptr;
-            else current->tickCallback = nullptr;
-            if (current->luaRef == LUA_REFNIL && !current->tickCallback && !current->probeCallback)
+            const bool hasOtherRole = probe ? current->tickCallback != nullptr : current->probeCallback != nullptr;
+            if (current->luaRef == LUA_REFNIL && !hasOtherRole)
             {
-                MH_DisableHook(current->target);
+                const MH_STATUS disabled = MH_DisableHook(current->target);
+                if (disabled != MH_OK && disabled != MH_ERROR_DISABLED)
+                {
+                    error = std::string("failed to replace scheduler hook: ") + MH_StatusToString(disabled);
+                    if (next->luaRef == LUA_REFNIL && !next->tickCallback && !next->probeCallback)
+                    {
+                        const MH_STATUS rollback = MH_DisableHook(next->target);
+                        if (rollback == MH_OK || rollback == MH_ERROR_DISABLED) next->enabled = false;
+                        else error += std::string("; new hook disable failed: ") + MH_StatusToString(rollback);
+                    }
+                    return false;
+                }
                 current->enabled = false;
             }
+            if (probe) current->probeCallback = nullptr;
+            else current->tickCallback = nullptr;
         }
         if (probe) next->probeCallback = callback;
         else next->tickCallback = callback;
         next->enabled = true;
         current = next;
+        return true;
     };
     for (auto& item : g_entries)
     {
@@ -818,26 +962,33 @@ static bool InstallInternalHook(MonoMethod* method, void (*callback)(), bool pro
             error = "internal hook method shares its native address with another registered Mono method";
             return false;
         }
-        g_methods[method] = item.get();
         const MH_STATUS status = MH_EnableHook(target);
         if (status != MH_OK && status != MH_ERROR_ENABLED)
         {
             error = std::string("failed to enable internal hook: ") + MH_StatusToString(status);
             return false;
         }
-        commitRole(item.get());
-        return true;
+        item->enabled = true;
+        return commitRole(item.get());
+    }
+    if (g_methods.find(method) != g_methods.end())
+    {
+        error = "method native address changed; refresh metadata before reinstalling";
+        return false;
     }
     auto entry = std::make_unique<HookEntry>(std::move(prepared));
     entry->id = static_cast<uint32_t>(g_entries.size());
-    if (!EnableNativeHook(*entry, error))
+    // 修改可执行代码前先完成所有拥有容器的分配。
+    g_entries.reserve(g_entries.size() + 1);
+    HookEntry* next = entry.get();
+    g_methods.emplace(method, next);
+    g_entries.push_back(std::move(entry));
+    PendingRegistration registration{next};
+    if (!EnableNativeHook(*next, error))
     {
         return false;
     }
-    commitRole(entry.get());
-    g_methods[method] = entry.get();
-    g_entries.push_back(std::move(entry));
-    return true;
+    return commitRole(next);
 }
 
 bool MonoHook::InstallTick(MonoMethod* method, void (*callback)(), std::string& error)
@@ -848,6 +999,25 @@ bool MonoHook::InstallTick(MonoMethod* method, void (*callback)(), std::string& 
 bool MonoHook::InstallMainThreadProbe(MonoMethod* method, void (*callback)(), std::string& error)
 {
     return InstallInternalHook(method, callback, true, error);
+}
+
+bool MonoHook::InstallSchedulerEntry(MonoMethod* method, const MonoScheduler::Candidate& candidate,
+                                    void (*callback)(), bool probe, std::string& error)
+{
+    // 调度器候选来自目标游戏的私有 Mono 构建。元数据或目标指针异常只能
+    // 影响调度器，不能逃逸到 WorkerThread 并隔离整个 Lua/管道会话。
+    MonoFeatureFault fault;
+    fault.stage = "scheduler hook installation";
+    fault.catchAllMemoryAccess = true;
+    __try
+    {
+        return InstallInternalHook(method, callback, probe, error, &candidate);
+    }
+    __except (fault.Filter(GetExceptionInformation()))
+    {
+    }
+    fault.Describe(fault.stage, error);
+    return false;
 }
 
 void MonoHook::UnhookAll()

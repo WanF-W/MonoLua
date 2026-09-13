@@ -9,15 +9,19 @@
 #include "common.h"
 #include "mono_api.h"
 struct lua_State;
+namespace MonoScheduler { struct Candidate; }
 
 namespace MonoHook
 {
     bool HookMethod(lua_State* state, MonoMethod* method, int callbackIndex, std::string& error);
     bool UnhookMethod(MonoMethod* method);
     bool IsHooked(MonoMethod* method);
-    // The caller owns scheduling policy; Hook only invokes the supplied tick callback.
+    // 调度策略由调用方负责；Hook 层只调用传入的 tick 回调。
     bool InstallTick(MonoMethod* method, void (*callback)(), std::string& error);
     bool InstallMainThreadProbe(MonoMethod* method, void (*callback)(), std::string& error);
+    // 调度器固定候选绕过反射检查，但仍执行通用 ABI 校验。
+    bool InstallSchedulerEntry(MonoMethod* method, const MonoScheduler::Candidate& candidate,
+                               void (*callback)(), bool probe, std::string& error);
     void UnhookAll();
     void InvalidateMetadata();
     void DrainDeferred();

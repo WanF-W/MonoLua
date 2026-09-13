@@ -21,6 +21,7 @@ struct MonoAssemblyInfo
 class MonoRuntime
 {
   public:
+    enum class GenericMethodKind { NonGeneric, Generic, Unknown };
     static MonoRuntime& Instance();
     bool Init();
     void Shutdown();
@@ -34,7 +35,7 @@ class MonoRuntime
     bool FindAssembly(const std::string& name, MonoAssemblyInfo& result) const;
     bool FindAssemblyByImage(MonoImage* image, MonoAssemblyInfo& result) const;
     MonoClass* FindClass(const char* nameSpace, const char* name) const;
-    bool InspectMethodGenerics(MonoMethod* method, bool& isGeneric) const;
+    GenericMethodKind InspectMethodGenerics(MonoMethod* method, std::string& error) const;
     bool InspectOpenMethod(MonoMethod* method, bool& containsGenericParameters) const;
     bool TakeMetadataChanged();
     std::string Status() const;

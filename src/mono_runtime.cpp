@@ -8,6 +8,7 @@
 #include "mono_resolver.h"
 #include "mono_handle.h"
 #include "mono_metadata.h"
+#include "mono_feature_fault.h"
 
 #include <algorithm>
 #include <cctype>
@@ -175,39 +176,86 @@ MonoClass* MonoRuntime::FindClass(const char* nameSpace, const char* name) const
     return nullptr;
 }
 
-bool MonoRuntime::InspectMethodGenerics(MonoMethod* method, bool& isGeneric) const
+static MonoRuntime::GenericMethodKind InspectMethodGenericsImpl(
+    const MonoRuntime& runtime, MonoMethod* method, MonoFeatureFault& fault)
 {
+    using Kind = MonoRuntime::GenericMethodKind;
+    if (!method) return Kind::Unknown;
     auto& resolver = MonoResolver::Instance();
-    isGeneric = resolver.TypeKind(resolver.ClassType(resolver.MethodClass(method))) ==
-                mono_metadata::TYPE_GENERICINST;
-    if (isGeneric) return true;
-    if (resolver.CanInspectGenericMethods())
-    {
-        isGeneric = resolver.MethodIsGeneric(method);
-        return true;
-    }
-    // Unity Mono versions do not consistently export the native generic predicates.
-    // MethodInfo.IsGenericMethod includes both definitions and constructed methods.
-    MonoObject* reflection = resolver.MethodObject(Domain(), method);
-    if (!reflection) return false;
+    // 通过反射同时查询方法和声明类型，不读取 MonoClass 的私有类型表示。
+    // 查询失败只能返回 Unknown，不能据此认定方法是泛型。
+    fault.stage = "generic inspection: current domain";
+    MonoDomain* domain = runtime.Domain();
+    fault.stage = "generic inspection: mono_method_get_object";
+    MonoObject* reflection = resolver.MethodObject(domain, method);
+    if (!reflection) return Kind::Unknown;
+    fault.stage = "generic inspection: root MethodInfo";
     mono::ScopedGCHandle root(resolver, resolver.CreateGCHandle(reflection, true));
-    if (!root.value) return false;
-    for (MonoClass* klass = resolver.ObjectClass(root.Target()); klass; klass = resolver.ClassParent(klass))
-        for (MonoMethod* getter : resolver.EnumerateMethods(klass))
-        {
-            const char* name = resolver.MethodName(getter);
-            if (!name || strcmp(name, "get_IsGenericMethod") != 0 ||
-                !resolver.MethodParameters(getter).empty())
-                continue;
-            MonoObject* exception = nullptr;
-            MonoObject* result = resolver.Invoke(getter, root.Target(), nullptr, &exception);
-            if (exception || !result) return false;
-            const auto* value = static_cast<const uint8_t*>(resolver.Unbox(result));
-            if (!value) return false;
-            isGeneric = *value != 0;
-            return true;
-        }
-    return false;
+    if (!root.value) return Kind::Unknown;
+    const auto property = [&resolver, &fault](MonoObject* object, const char* getterName,
+                                              const char* invokeStage) -> MonoObject* {
+        if (!object) return nullptr;
+        fault.stage = getterName;
+        for (MonoClass* klass = resolver.ObjectClass(object); klass; klass = resolver.ClassParent(klass))
+            for (MonoMethod* getter : resolver.EnumerateMethods(klass))
+            {
+                const char* name = resolver.MethodName(getter);
+                if (!name || strcmp(name, getterName) != 0 || !resolver.MethodParameters(getter).empty()) continue;
+                MonoObject* exception = nullptr;
+                fault.stage = invokeStage;
+                MonoObject* result = resolver.Invoke(getter, object, nullptr, &exception);
+                return exception ? nullptr : result;
+            }
+        return nullptr;
+    };
+    MonoObject* genericMethod = property(root.Target(), "get_IsGenericMethod",
+                                        "generic inspection: invoke IsGenericMethod");
+    if (!genericMethod) return Kind::Unknown;
+    fault.stage = "generic inspection: root IsGenericMethod result";
+    mono::ScopedGCHandle methodResult(resolver, resolver.CreateGCHandle(genericMethod, true));
+    if (!methodResult.value) return Kind::Unknown;
+    fault.stage = "generic inspection: unbox IsGenericMethod";
+    const auto* methodFlag = static_cast<const uint8_t*>(resolver.Unbox(methodResult.Target()));
+    if (!methodFlag) return Kind::Unknown;
+    if (*methodFlag)
+        return Kind::Generic;
+    MonoObject* declaringType = property(root.Target(), "get_DeclaringType",
+                                        "generic inspection: invoke DeclaringType");
+    if (!declaringType) return Kind::Unknown;
+    fault.stage = "generic inspection: root declaring type";
+    mono::ScopedGCHandle typeRoot(resolver, resolver.CreateGCHandle(declaringType, true));
+    if (!typeRoot.value) return Kind::Unknown;
+    MonoObject* genericType = property(typeRoot.Target(), "get_IsGenericType",
+                                      "generic inspection: invoke IsGenericType");
+    if (!genericType) return Kind::Unknown;
+    fault.stage = "generic inspection: root IsGenericType result";
+    mono::ScopedGCHandle typeResult(resolver, resolver.CreateGCHandle(genericType, true));
+    if (!typeResult.value) return Kind::Unknown;
+    fault.stage = "generic inspection: unbox IsGenericType";
+    const auto* typeFlag = static_cast<const uint8_t*>(resolver.Unbox(typeResult.Target()));
+    if (!typeFlag) return Kind::Unknown;
+    return *typeFlag ? Kind::Generic : Kind::NonGeneric;
+}
+
+MonoRuntime::GenericMethodKind MonoRuntime::InspectMethodGenerics(MonoMethod* method, std::string& error) const
+{
+    MonoFeatureFault fault;
+    GenericMethodKind kind = GenericMethodKind::Unknown;
+    error.clear();
+    __try
+    {
+        kind = InspectMethodGenericsImpl(*this, method, fault);
+    }
+    __except (fault.Filter(GetExceptionInformation()))
+    {
+    }
+    if (fault.code) fault.Describe(fault.stage, error);
+    else if (kind == GenericMethodKind::Unknown)
+    {
+        error = fault.stage;
+        error += ": no usable reflection result";
+    }
+    return kind;
 }
 
 bool MonoRuntime::InspectOpenMethod(MonoMethod* method, bool& containsGenericParameters) const

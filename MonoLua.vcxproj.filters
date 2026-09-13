@@ -78,6 +78,8 @@
     <ClInclude Include="src\lua_engine.h"><Filter>h_src</Filter></ClInclude>
     <ClInclude Include="src\mono_api.h"><Filter>h_src</Filter></ClInclude>
     <ClInclude Include="src\mono_handle.h"><Filter>h_src</Filter></ClInclude>
+    <ClInclude Include="src\mono_feature_fault.h"><Filter>h_src</Filter></ClInclude>
+    <ClInclude Include="src\mono_scheduler_candidates.h"><Filter>h_src</Filter></ClInclude>
     <ClInclude Include="src\mono_metadata.h"><Filter>h_src</Filter></ClInclude>
     <ClInclude Include="src\mono_hook.h"><Filter>h_src</Filter></ClInclude>
     <ClInclude Include="src\mono_resolver.h"><Filter>h_src</Filter></ClInclude>

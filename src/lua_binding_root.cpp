@@ -126,9 +126,7 @@ namespace
     {
         // 状态查询只读取快照，不触发跨模块失效。
         std::string status = MonoRuntime::Instance().Status();
-        // Keep the label consistent with il2cpp.get_status(); this is the
-        // scheduler/tick readiness state, while thread identity is confirmed
-        // by the independent probe.
+        // 与 Il2Cpp 后端保持一致；线程身份仍由独立探针确认。
         status += "\nMain thread: ";
         status += MonoScheduler::IsReady() ? "ready" : "not ready";
         status += "\nRejected log batches: " + std::to_string(PipeChannel::Instance().DroppedLogs());

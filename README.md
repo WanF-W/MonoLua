@@ -153,7 +153,7 @@ print(lua.hex(field:get_offset()))
 | `mono.schedule(callback)` | 将无参 Lua 回调加入主线程任务队列 |
 | `mono.set_tick(method)` | 设置任务调度使用的 tick 方法 |
 | `mono.get_tick()` | 返回 tick 方法签名，未设置时返回 `nil` |
-| `mono.is_tick_ready()` | 返回 tick Hook 是否已安装，不表示主线程探针已确认线程 |
+| `mono.is_tick_ready()` | 返回 tick Hook 是否已安装 |
 
 <a name="mono-runtime-status"></a>
 #### 📊 运行时状态
@@ -167,7 +167,7 @@ for _, name in ipairs(mono.get_missing_exports()) do
 end
 ```
 
-状态文本使用与 `il2cpp.get_status()` 一致的 `Initialized`、`Exports`、`Assemblies`、`Images`、`Main thread` 和 `Rejected log batches` 字段；Mono 额外报告 Root/Worker domain、metadata generation 与 Mono 模块地址。`Main thread` 表示调度 Hook 已安装，实际执行线程仍须由主线程探针确认。Mono 当前只统计提交阶段被拒绝的日志批次，未将传输失败或关闭时清空的分片混入该计数。
+状态文本使用与 `il2cpp.get_status()` 一致的 `Initialized`、`Exports`、`Assemblies`、`Images`、`Main thread` 和 `Rejected log batches` 字段；Mono 额外报告 Root/Worker domain、metadata generation 与 Mono 模块地址。`Main thread` 表示调度 tick Hook 是否已安装，实际执行线程仍须由独立主线程探针确认。Mono 当前只统计提交阶段被拒绝的日志批次，未将传输失败或关闭时清空的分片混入该计数。
 
 <a name="mono-assembly-search"></a>
 #### 🔎 程序集查找
@@ -215,7 +215,9 @@ mono.schedule(function()
 end)
 ```
 
-自动 tick 会尝试使用 `UnityEngine.Time` 的帧入口。也可以手动指定：
+调度器在启动阶段自动初始化，随后发送 `Ready`，无需先调用 `schedule()` 激活。探针依次尝试 `UnitySynchronizationContext.ExecuteTasks`、`Time.get_deltaTime`；tick 依次尝试 `Time.get_deltaTime`、`Time.get_frameCount`、`Object.get_name`。探针和 tick 通常使用不同入口；只有探针回退到 `get_deltaTime` 时才共用同一个 Hook。失败后继续下一个候选；全部失败才报告调度器不可用，基础会话仍完成握手。
+
+这些固定的非泛型 Unity 候选走专用准备入口，校验参数、静态属性、返回类型和支持的 ABI，不调用泛型反射查询，不要求程序集文件名精确匹配或实现标志全部为零。通用用户 Hook 和 `mono.set_tick(method)` 对非固定入口仍走通用检查；可以手动指定 tick：
 
 ```lua
 local time = mono.get_class("UnityEngine", "Time")
@@ -230,11 +232,15 @@ print(mono.get_tick())
 print(mono.is_tick_ready())
 ```
 
-任务队列最多保存 1024 项；队列满时 `mono.schedule()` 抛出错误。没有可用 tick 时，任务会保留到 tick 设置完成后执行。
+任务队列最多保存 1024 项；队列满时 `mono.schedule()` 抛出错误。调度器安装失败时回调仍会保留在队列中，之后可以通过 `mono.set_tick()` 重试。安装成功但尚未确认线程时允许排队，等待游戏自然调用入口。
 
-线程身份由独立的一次性探针确认，优先使用 `UnitySynchronizationContext.ExecuteTasks`，安装失败时尝试 `Time.get_deltaTime`。控制台 Lua、MonoLua 的 `runtime_invoke` 和嵌套 Hook 不参与确认；确认后撤销探针身份，只保留同一入口上的 tick 或用户 Hook。切换 tick 不会重置线程身份，探针或 tick 安装失败不会丢弃已入队任务，可再次调用 `mono.set_tick()` 重试。
+线程身份由一次性探针确认。控制台 Lua、MonoLua 的 `runtime_invoke` 和嵌套 Hook 不参与确认；确认后撤销探针身份，只保留同一入口上的 tick 或用户 Hook。切换 tick 不会重置线程身份；替换失败保留已有 tick 和已入队任务。`get_deltaTime` 后备探针沿用原有行为，依赖游戏在主线程自然调用该入口，无法排除游戏自身工作线程的直接调用。
 
-`get_deltaTime` 后备探针依赖游戏在主线程自然调用该入口；它无法排除游戏自身工作线程的直接调用。优先探针安装成功但从未被游戏调用时，队列会继续等待，`is_tick_ready()` 仍可能为 `true`。
+`mono.get_status()` 的 `Main thread` 字段表示 tick Hook 是否已安装，实际执行线程仍由独立探针确认。入口安装成功但从未被游戏调用时，队列继续等待，`is_tick_ready()` 仍只反映 Hook 安装状态。
+
+候选查找和 Hook 元数据检查在提交原生 Hook 前具有局部异常边界：读取访问异常转为包含具体阶段的功能错误，不设置会话故障、不关闭管道。单个候选创建或启用失败时继续尝试后备入口；全部失败只报告调度器不可用，基础会话仍可通信。调度器只输出失败诊断，且在 `Ready` 发送后单独输出，不插入握手帧。此边界不吞掉写入/执行访问异常、栈损坏或已有的会话故障。
+
+通用 Hook 的泛型判断区分非泛型、泛型、无法判断。它查询方法及其声明类型的反射属性，不再调用 `mono_class_get_type` 或不存在的泛型导出判断方法。反射查询失败或被局部边界捕获时返回具体原因，仅拒绝当前 Hook；固定调度候选不受这条反射查询的影响。泛型方法和泛型类型上的方法目前仍不支持通用 Hook。
 
 InternalCall Hook 使用 `mono_lookup_internal_call` 获取原生地址，目前支持 `UnityEngine.Time` 中静态、无参数、数值返回的 getter（包括 `get_deltaTime()`、`get_frameCount()`、`get_timeScale()`、`get_unscaledDeltaTime()` 和 `get_realtimeSinceStartup()`）。带对象、结构体、参数或隐藏 ABI 的 InternalCall 会返回明确错误；普通 Mono 方法仍使用 JIT 地址。不同方法共享同一 native 地址时拒绝重复注册，MinHook 安装失败会保留具体状态。
 

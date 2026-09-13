@@ -152,6 +152,12 @@
       <!-- Lua bounds hash shifts to fit int before converting their result to size_t. -->
       <DisableSpecificWarnings>4244;4310;4324;4334;4701;4702;%(DisableSpecificWarnings)</DisableSpecificWarnings>
     </ClCompile>
+    <ClCompile Update="src\*.cpp">
+      <!-- 桥接层和 Lua 实现链接在同一个 DLL 中；桥接源文件也必须使用
+           Lua API 的导出声明，否则 MSVC 会按 dllimport 处理并为每个 API
+           产生 LNK4217/LNK4286。 -->
+      <ForcedIncludeFiles>$(ProjectDir)src\lua_cpp.h;%(ForcedIncludeFiles)</ForcedIncludeFiles>
+    </ClCompile>
     <ClCompile Update="minhook_src\*.c">
       <DisableSpecificWarnings>4201;4206;4244;4310;%(DisableSpecificWarnings)</DisableSpecificWarnings>
     </ClCompile>
@@ -203,6 +209,8 @@
     <ClInclude Include="src\lua_engine.h" />
     <ClInclude Include="src\mono_api.h" />
     <ClInclude Include="src\mono_handle.h" />
+    <ClInclude Include="src\mono_feature_fault.h" />
+    <ClInclude Include="src\mono_scheduler_candidates.h" />
     <ClInclude Include="src\mono_metadata.h" />
     <ClInclude Include="src\mono_hook.h" />
     <ClInclude Include="src\mono_resolver.h" />

@@ -55,8 +55,6 @@ class MonoResolver
     uint32_t MethodFlags(MonoMethod* method) const;
     uint32_t MethodImplementationFlags(MonoMethod* method) const;
     void* LookupInternalCall(MonoMethod* method) const;
-    bool MethodIsGeneric(MonoMethod* method) const;
-    bool CanInspectGenericMethods() const { return m_methodIsGeneric && m_methodIsInflated; }
     MonoObject* MethodObject(MonoDomain* domain, MonoMethod* method) const;
     MonoObject* Invoke(MonoMethod* method, void* object, void** parameters, MonoObject** exception) const;
     void* Unbox(MonoObject* object) const;
@@ -139,7 +137,6 @@ class MonoResolver
     using FnMethodGetClass = MonoClass* (*)(MonoMethod*);
     using FnMethodSignature = MonoMethodSignature* (*)(MonoMethod*);
     using FnMethodGetFlags = uint32_t (*)(MonoMethod*, uint32_t*);
-    using FnMethodIsGeneric = int (*)(MonoMethod*);
     using FnMethodGetObject = MonoObject* (*)(MonoDomain*, MonoMethod*, MonoClass*);
     using FnMethodGetParamNames = void (*)(MonoMethod*, const char**);
     using FnSignatureGetReturnType = MonoType* (*)(MonoMethodSignature*);
@@ -222,8 +219,6 @@ class MonoResolver
     FnMethodGetClass m_methodGetClass = nullptr;
     FnMethodSignature m_methodSignature = nullptr;
     FnMethodGetFlags m_methodGetFlags = nullptr;
-    FnMethodIsGeneric m_methodIsGeneric = nullptr;
-    FnMethodIsGeneric m_methodIsInflated = nullptr;
     FnMethodGetObject m_methodGetObject = nullptr;
     FnMethodGetParamNames m_methodGetParamNames = nullptr;
     FnSignatureGetReturnType m_signatureGetReturnType = nullptr;

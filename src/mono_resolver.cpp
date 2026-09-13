@@ -167,10 +167,8 @@ bool MonoResolver::ResolveExports()
     ok &= required(m_methodGetClass, "mono_method_get_class");
     ok &= required(m_methodSignature, "mono_method_signature");
     ok &= required(m_methodGetFlags, "mono_method_get_flags");
-    optional(m_methodIsGeneric, "mono_method_is_generic");
     optional(m_methodGetObject, "mono_method_get_object");
     optional(m_methodGetParamNames, "mono_method_get_param_names");
-    optional(m_methodIsInflated, "mono_method_is_inflated");
     ok &= required(m_signatureGetReturnType, "mono_signature_get_return_type");
     ok &= required(m_signatureGetParams, "mono_signature_get_params");
     ok &= required(m_typeGetName, "mono_type_get_name");
@@ -257,10 +255,8 @@ void MonoResolver::Shutdown()
     m_methodGetClass = nullptr;
     m_methodSignature = nullptr;
     m_methodGetFlags = nullptr;
-    m_methodIsGeneric = nullptr;
     m_methodGetObject = nullptr;
     m_methodGetParamNames = nullptr;
-    m_methodIsInflated = nullptr;
     m_signatureGetReturnType = nullptr;
     m_signatureGetParams = nullptr;
     m_typeGetName = nullptr;
@@ -510,13 +506,6 @@ MonoType* MonoResolver::MethodReturnType(MonoMethod* method) const
 uint32_t MonoResolver::MethodFlags(MonoMethod* method) const
 {
     return m_methodGetFlags && method ? m_methodGetFlags(method, nullptr) : 0;
-}
-
-bool MonoResolver::MethodIsGeneric(MonoMethod* method) const
-{
-    if (!method) return false;
-    return (m_methodIsGeneric && m_methodIsGeneric(method) != 0) ||
-           (m_methodIsInflated && m_methodIsInflated(method) != 0);
 }
 
 MonoObject* MonoResolver::MethodObject(MonoDomain* domain, MonoMethod* method) const

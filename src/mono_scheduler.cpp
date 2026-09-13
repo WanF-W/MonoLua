@@ -8,6 +8,8 @@
 #include "mono_runtime.h"
 #include "mono_resolver.h"
 #include "lua_engine.h"
+#include "mono_feature_fault.h"
+#include "mono_scheduler_candidates.h"
 
 extern "C"
 {
@@ -22,8 +24,10 @@ namespace
     std::vector<int> g_queue;
     MonoMethod* g_tick = nullptr;
     std::atomic<DWORD> g_mainThread{0};
-    bool g_probeInstalled = false; // protected by the Lua mutex
-    bool g_installFailureLogged = false;
+    bool g_probeInstalled = false; // 由 Lua 互斥锁保护
+    bool g_diagnosticsReady = false; // 由 Lua 互斥锁保护
+    bool g_failureLogged = false; // 由 Lua 互斥锁保护
+    std::string g_pendingDiagnostics; // 由 Lua 互斥锁保护
     thread_local bool g_draining = false;
 
     void ConfirmMainThread()
@@ -32,37 +36,104 @@ namespace
         g_mainThread.compare_exchange_strong(expected, GetCurrentThreadId());
     }
 
+    void ReportCandidate(const MonoScheduler::Candidate& candidate, const char* role,
+                         bool installed, const std::string& detail)
+    {
+        if (installed) return;
+        const std::string message = std::string("[scheduler] ") + role + " " + candidate.klass + "." +
+            candidate.method + ": " + detail + '\n';
+        OutputDebugStringA(message.c_str());
+        if (g_diagnosticsReady)
+            LuaEngine::Instance().EmitOutput(message.c_str());
+        else
+            g_pendingDiagnostics += message;
+    }
+
+    void ReportSchedulerFailure(const std::string& error)
+    {
+        if (g_failureLogged) return;
+        g_failureLogged = true;
+        const std::string message = "[warning] main-thread scheduler unavailable: " + error + '\n';
+        OutputDebugStringA(message.c_str());
+        if (g_diagnosticsReady)
+            LuaEngine::Instance().EmitOutput(message.c_str());
+        else
+            g_pendingDiagnostics += message;
+    }
+
+    MonoMethod* FindSchedulerEntryImpl(const MonoScheduler::Candidate& candidate, std::string& error,
+                                      MonoFeatureFault& fault)
+    {
+        auto& resolver = MonoResolver::Instance();
+        fault.stage = "scheduler discovery: find class";
+        MonoClass* klass = MonoRuntime::Instance().FindClass("UnityEngine", candidate.klass);
+        if (!klass)
+        {
+            error = "class not found";
+            return nullptr;
+        }
+        fault.stage = "scheduler discovery: enumerate methods";
+        for (MonoMethod* method : resolver.EnumerateMethods(klass))
+        {
+            fault.stage = "scheduler discovery: method name";
+            const char* name = resolver.MethodName(method);
+            if (!name || strcmp(name, candidate.method) != 0) continue;
+            fault.stage = "scheduler discovery: parameter signature";
+            if (resolver.MethodParameters(method).empty()) return method;
+        }
+        error = "parameterless method not found";
+        return nullptr;
+    }
+
+    MonoMethod* FindSchedulerEntry(const MonoScheduler::Candidate& candidate, std::string& error)
+    {
+        MonoFeatureFault fault;
+        __try
+        {
+            return FindSchedulerEntryImpl(candidate, error, fault);
+        }
+        __except (fault.Filter(GetExceptionInformation()))
+        {
+        }
+        fault.Describe(fault.stage, error);
+        return nullptr;
+    }
+
+    const MonoScheduler::Candidate* FindFixedCandidate(MonoMethod* method)
+    {
+        if (!method) return nullptr;
+        for (const auto* candidate : {&MonoScheduler::ExecuteTasks, &MonoScheduler::DeltaTime,
+                                      &MonoScheduler::FrameCount, &MonoScheduler::ObjectName})
+        {
+            std::string detail;
+            if (FindSchedulerEntry(*candidate, detail) == method) return candidate;
+        }
+        return nullptr;
+    }
+
     bool EnsureMainThreadProbe(std::string& error)
     {
         if (g_mainThread.load() || g_probeInstalled) return true;
-        struct Candidate { const char* klass; const char* method; };
-        static constexpr Candidate candidates[] = {
-            {"UnitySynchronizationContext", "ExecuteTasks"}, {"Time", "get_deltaTime"}};
-        auto& resolver = MonoResolver::Instance();
-        std::string failures;
-        for (const auto& candidate : candidates)
+        error.clear();
+        for (const auto* candidate : {&MonoScheduler::ExecuteTasks, &MonoScheduler::DeltaTime})
         {
-            MonoClass* klass = MonoRuntime::Instance().FindClass("UnityEngine", candidate.klass);
-            if (!klass) continue;
-            for (MonoMethod* method : resolver.EnumerateMethods(klass))
+            std::string detail;
+            MonoMethod* method = FindSchedulerEntry(*candidate, detail);
+            const bool installed = method &&
+                MonoHook::InstallSchedulerEntry(method, *candidate, ConfirmMainThread, true, detail);
+            ReportCandidate(*candidate, "probe", installed, detail);
+            if (installed)
             {
-                const char* name = resolver.MethodName(method);
-                if (!name || strcmp(name, candidate.method) != 0 ||
-                    !resolver.MethodParameters(method).empty()) continue;
-                std::string detail;
-                if (MonoHook::InstallMainThreadProbe(method, ConfirmMainThread, detail))
-                {
-                    g_probeInstalled = true;
-                    return true;
-                }
-                if (!failures.empty()) failures += "; ";
-                failures += std::string(candidate.klass) + "." + candidate.method + ": " + detail;
+                g_probeInstalled = true;
+                error.clear();
+                return true;
             }
+            if (!error.empty()) error += "; ";
+            error += std::string(candidate->klass) + "." + candidate->method + ": " + detail;
         }
-        error = "main-thread probe unavailable";
-        if (!failures.empty()) error += ": " + failures;
         return false;
     }
+
 } // namespace
 
 bool MonoScheduler::Schedule(lua_State* state, int callbackIndex)
@@ -71,25 +142,26 @@ bool MonoScheduler::Schedule(lua_State* state, int callbackIndex)
     if (!state || lua_type(state, callbackIndex) != LUA_TFUNCTION) return false;
     lua_pushvalue(state, callbackIndex);
     const int reference = luaL_ref(state, LUA_REGISTRYINDEX);
+    bool queued = false;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
-        if (g_queue.size() >= MAX_SCHEDULE_QUEUE)
+        if (g_queue.size() < MAX_SCHEDULE_QUEUE)
         {
-            luaL_unref(state, LUA_REGISTRYINDEX, reference);
-            return false;
+            g_queue.push_back(reference);
+            queued = true;
         }
-        g_queue.push_back(reference);
     }
+    if (!queued)
+    {
+        luaL_unref(state, LUA_REGISTRYINDEX, reference);
+        return false;
+    }
+    // 调度器暂时不可用时仍保留任务，
+    // 后续可以通过 set_tick 或下一次自动尝试恢复。
     if (!IsReady() || (!g_mainThread.load() && !g_probeInstalled))
     {
         std::string error;
-        if (!AutoSetTick(error) && !g_installFailureLogged)
-        {
-            g_installFailureLogged = true;
-            const std::string warning =
-                "[schedule] " + error + "; callbacks remain queued; use mono.set_tick().\n";
-            LuaEngine::Instance().EmitOutput(warning.c_str());
-        }
+        AutoSetTick(error);
     }
     return true;
 }
@@ -97,11 +169,17 @@ bool MonoScheduler::Schedule(lua_State* state, int callbackIndex)
 bool MonoScheduler::SetTick(MonoMethod* method, std::string& error)
 {
     std::lock_guard<std::recursive_mutex> luaLock(LuaEngine::Instance().GetMutex());
+    error.clear();
     if (!EnsureMainThreadProbe(error)) return false;
-    if (!MonoHook::InstallTick(method, OnTick, error)) return false;
+    // 手动指定内置 Unity 入口时也走固定候选路径，避免再次触发泛型反射查询。
+    if (const auto* candidate = FindFixedCandidate(method))
+    {
+        if (!MonoHook::InstallSchedulerEntry(method, *candidate, OnTick, false, error)) return false;
+    }
+    else if (!MonoHook::InstallTick(method, OnTick, error)) return false;
     std::lock_guard<std::mutex> lock(g_mutex);
     g_tick = method;
-    g_installFailureLogged = false;
+    g_failureLogged = false;
     return true;
 }
 
@@ -109,34 +187,32 @@ bool MonoScheduler::AutoSetTick(std::string& error)
 {
     std::lock_guard<std::recursive_mutex> luaLock(LuaEngine::Instance().GetMutex());
     error.clear();
-    if (!EnsureMainThreadProbe(error)) return false;
-    if (IsReady()) return true;
-    struct Candidate
+    if (GetTick()) return true;
+    if (!EnsureMainThreadProbe(error))
     {
-        const char* klass;
-        const char* method;
-    };
-    static constexpr Candidate candidates[] = {
-        {"Time", "get_deltaTime"}, {"Time", "get_frameCount"}, {"Object", "get_name"}};
-    auto& resolver = MonoResolver::Instance();
-    std::string failures;
-    for (const auto& candidate : candidates)
-    {
-        MonoClass* klass = MonoRuntime::Instance().FindClass("UnityEngine", candidate.klass);
-        if (!klass) continue;
-        for (MonoMethod* method : resolver.EnumerateMethods(klass))
-        {
-            const char* methodName = resolver.MethodName(method);
-            if (!methodName || strcmp(methodName, candidate.method) != 0 ||
-                !resolver.MethodParameters(method).empty())
-                continue;
-            if (SetTick(method, error)) return true;
-            if (!failures.empty()) failures += "; ";
-            failures += std::string(candidate.klass) + "." + candidate.method + ": " + error;
-        }
+        ReportSchedulerFailure(error);
+        return false;
     }
-    error = "no usable Unity tick method was found";
-    if (!failures.empty()) error += ": " + failures;
+
+    std::string failures;
+    for (const auto* candidate : {&DeltaTime, &FrameCount, &ObjectName})
+    {
+        std::string detail;
+        MonoMethod* method = FindSchedulerEntry(*candidate, detail);
+        const bool installed = method && MonoHook::InstallSchedulerEntry(method, *candidate, OnTick, false, detail);
+        ReportCandidate(*candidate, "tick", installed, detail);
+        if (installed)
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            g_tick = method;
+            g_failureLogged = false;
+            return true;
+        }
+        if (!failures.empty()) failures += "; ";
+        failures += std::string(candidate->klass) + "." + candidate->method + ": " + detail;
+    }
+    error = "no usable Unity tick: " + failures;
+    ReportSchedulerFailure(error);
     return false;
 }
 
@@ -150,6 +226,16 @@ bool MonoScheduler::IsReady()
 {
     std::lock_guard<std::mutex> lock(g_mutex);
     return g_tick != nullptr;
+}
+
+void MonoScheduler::FlushDiagnostics()
+{
+    auto& engine = LuaEngine::Instance();
+    std::lock_guard<std::recursive_mutex> luaLock(engine.GetMutex());
+    g_diagnosticsReady = true;
+    if (g_pendingDiagnostics.empty()) return;
+    engine.EmitOutput(g_pendingDiagnostics.c_str());
+    g_pendingDiagnostics.clear();
 }
 
 void MonoScheduler::OnTick()
@@ -208,10 +294,13 @@ void MonoScheduler::InvalidateMetadata()
     g_tick = nullptr;
     g_mainThread = 0;
     g_probeInstalled = false;
-    g_installFailureLogged = false;
+    g_pendingDiagnostics.clear();
+    g_failureLogged = false;
 }
 
 void MonoScheduler::Shutdown()
 {
     InvalidateMetadata();
+    std::lock_guard<std::recursive_mutex> luaLock(LuaEngine::Instance().GetMutex());
+    g_diagnosticsReady = false;
 }

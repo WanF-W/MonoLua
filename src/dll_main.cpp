@@ -6,8 +6,21 @@
 #include "mono_resolver.h"
 #include "mono_scheduler.h"
 #include "pipe_channel.h"
+#include <cstdio>
 
 static HMODULE g_selfModule = nullptr;
+
+static int WorkerExceptionFilter(EXCEPTION_POINTERS* info) noexcept
+{
+    if (info && info->ExceptionRecord)
+    {
+        char message[160]{};
+        sprintf_s(message, "[MonoLua] worker native exception 0x%08lX at %p; session quarantined\n",
+                  info->ExceptionRecord->ExceptionCode, info->ExceptionRecord->ExceptionAddress);
+        OutputDebugStringA(message);
+    }
+    return LuaEngine::Instance().HandleNativeFault();
+}
 
 class ScopedMonoAttach final
 {
@@ -86,17 +99,14 @@ static void WorkerMain()
         return;
     }
     std::string tickError;
-    const bool tickReady = MonoScheduler::AutoSetTick(tickError);
-    if (!pipe.SendReady(tickReady ? "ready" : "ready (main-thread scheduler unavailable)"))
+    MonoScheduler::AutoSetTick(tickError);
+    // READY 只表示运行时和 Lua 已经可以通信；调度器诊断在握手完成后单独发送。
+    if (!pipe.SendReady("ready"))
     {
         ShutdownBridge();
         return;
     }
-    if (!tickReady)
-    {
-        const std::string warning = "[warning] main-thread scheduler unavailable: " + tickError + '\n';
-        pipe.SendLog(warning.c_str());
-    }
+    MonoScheduler::FlushDiagnostics();
 
     runtime.DetachInitializationThread();
     while (!lua.IsFaulted())
@@ -146,7 +156,7 @@ static DWORD WINAPI WorkerThread(void*)
     {
         WorkerMain();
     }
-    __except (LuaEngine::Instance().HandleNativeFault())
+    __except (WorkerExceptionFilter(GetExceptionInformation()))
     {
         // Do not run Lua finalizers or Mono cleanup after an escaped native fault.
         PipeChannel::Instance().Shutdown();
