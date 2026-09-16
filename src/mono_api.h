@@ -10,6 +10,9 @@
 
 #include <cstdint>
 
+// v2 handles are pointer-sized; legacy handles are widened only at the resolver boundary.
+using MonoGCHandle = uintptr_t;
+
 // Mono 元数据和对象均由目标进程中的运行时拥有。
 struct _MonoDomain;
 using MonoDomain = _MonoDomain;

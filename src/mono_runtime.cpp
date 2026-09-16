@@ -6,13 +6,19 @@
  */
 #include "mono_runtime.h"
 #include "mono_resolver.h"
-#include "mono_handle.h"
-#include "mono_metadata.h"
-#include "mono_feature_fault.h"
 
 #include <algorithm>
 #include <cctype>
 #include <sstream>
+
+namespace
+{
+    struct AssemblyCollection
+    {
+        std::vector<MonoAssemblyInfo>* values = nullptr;
+        bool failed = false;
+    };
+}
 
 MonoRuntime& MonoRuntime::Instance()
 {
@@ -65,11 +71,21 @@ void MonoRuntime::CollectAssembly(MonoAssembly* assembly, void* userData)
 {
     // mono_assembly_foreach 要求 C 风格回调，因此只在回调中收集借用指针，
     // 不获取 Runtime 互斥锁，避免回调内部与外层锁形成反向锁序。
-    auto* output = static_cast<std::vector<MonoAssemblyInfo>*>(userData);
-    auto& resolver = MonoResolver::Instance();
-    MonoImage* image = resolver.AssemblyImage(assembly);
-    const char* name = resolver.ImageName(image);
-    if (assembly && image && name && *name) output->push_back({assembly, image, name, 0});
+    auto* collection = static_cast<AssemblyCollection*>(userData);
+    if (!collection || !collection->values) return;
+    try
+    {
+        auto& resolver = MonoResolver::Instance();
+        MonoImage* image = resolver.AssemblyImage(assembly);
+        const char* name = resolver.ImageName(image);
+        if (assembly && image && name && *name)
+            collection->values->push_back({assembly, image, name, 0});
+    }
+    catch (...)
+    {
+        // 不能让 C++ 异常穿过 mono_assembly_foreach 的 C 回调边界。
+        collection->failed = true;
+    }
 }
 
 bool MonoRuntime::RefreshAssemblies()
@@ -78,12 +94,20 @@ bool MonoRuntime::RefreshAssemblies()
     // 先在锁外建立完整快照，成功后一次性交换。这样查询方永远不会看到
     // 枚举到一半的程序集列表。
     std::vector<MonoAssemblyInfo> fresh;
-    MonoResolver::Instance().EnumerateAssemblies(CollectAssembly, &fresh);
+    AssemblyCollection collection{&fresh, false};
+    MonoResolver::Instance().EnumerateAssemblies(CollectAssembly, &collection);
+    if (collection.failed || bridge_lifecycle::g_nativeCallFaulted)
+    {
+        bridge_lifecycle::ClearNativeCallFault();
+        m_lastError = collection.failed ? "failed to collect a Mono assembly snapshot"
+                                        : "native exception while enumerating Mono assemblies";
+        return false;
+    }
     bool invalidated = false;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
-        // Thread-local domains may differ without any metadata reload.
-        // Only a removed assembly invalidates the published snapshot.
+        // 不发生 metadata reload 时，各线程的 Domain 也可能不同。
+        // 只有程序集被移除才使已发布快照失效。
         for (const auto& previous : m_assemblies)
         {
             const auto found =
@@ -174,136 +198,6 @@ MonoClass* MonoRuntime::FindClass(const char* nameSpace, const char* name) const
         if (klass) return klass;
     }
     return nullptr;
-}
-
-static MonoRuntime::GenericMethodKind InspectMethodGenericsImpl(
-    const MonoRuntime& runtime, MonoMethod* method, MonoFeatureFault& fault)
-{
-    using Kind = MonoRuntime::GenericMethodKind;
-    if (!method) return Kind::Unknown;
-    auto& resolver = MonoResolver::Instance();
-    // 通过反射同时查询方法和声明类型，不读取 MonoClass 的私有类型表示。
-    // 查询失败只能返回 Unknown，不能据此认定方法是泛型。
-    fault.stage = "generic inspection: current domain";
-    MonoDomain* domain = runtime.Domain();
-    fault.stage = "generic inspection: mono_method_get_object";
-    MonoObject* reflection = resolver.MethodObject(domain, method);
-    if (!reflection) return Kind::Unknown;
-    fault.stage = "generic inspection: root MethodInfo";
-    mono::ScopedGCHandle root(resolver, resolver.CreateGCHandle(reflection, true));
-    if (!root.value) return Kind::Unknown;
-    const auto property = [&resolver, &fault](MonoObject* object, const char* getterName,
-                                              const char* invokeStage) -> MonoObject* {
-        if (!object) return nullptr;
-        fault.stage = getterName;
-        for (MonoClass* klass = resolver.ObjectClass(object); klass; klass = resolver.ClassParent(klass))
-            for (MonoMethod* getter : resolver.EnumerateMethods(klass))
-            {
-                const char* name = resolver.MethodName(getter);
-                if (!name || strcmp(name, getterName) != 0 || !resolver.MethodParameters(getter).empty()) continue;
-                MonoObject* exception = nullptr;
-                fault.stage = invokeStage;
-                MonoObject* result = resolver.Invoke(getter, object, nullptr, &exception);
-                return exception ? nullptr : result;
-            }
-        return nullptr;
-    };
-    MonoObject* genericMethod = property(root.Target(), "get_IsGenericMethod",
-                                        "generic inspection: invoke IsGenericMethod");
-    if (!genericMethod) return Kind::Unknown;
-    fault.stage = "generic inspection: root IsGenericMethod result";
-    mono::ScopedGCHandle methodResult(resolver, resolver.CreateGCHandle(genericMethod, true));
-    if (!methodResult.value) return Kind::Unknown;
-    fault.stage = "generic inspection: unbox IsGenericMethod";
-    const auto* methodFlag = static_cast<const uint8_t*>(resolver.Unbox(methodResult.Target()));
-    if (!methodFlag) return Kind::Unknown;
-    if (*methodFlag)
-        return Kind::Generic;
-    MonoObject* declaringType = property(root.Target(), "get_DeclaringType",
-                                        "generic inspection: invoke DeclaringType");
-    if (!declaringType) return Kind::Unknown;
-    fault.stage = "generic inspection: root declaring type";
-    mono::ScopedGCHandle typeRoot(resolver, resolver.CreateGCHandle(declaringType, true));
-    if (!typeRoot.value) return Kind::Unknown;
-    MonoObject* genericType = property(typeRoot.Target(), "get_IsGenericType",
-                                      "generic inspection: invoke IsGenericType");
-    if (!genericType) return Kind::Unknown;
-    fault.stage = "generic inspection: root IsGenericType result";
-    mono::ScopedGCHandle typeResult(resolver, resolver.CreateGCHandle(genericType, true));
-    if (!typeResult.value) return Kind::Unknown;
-    fault.stage = "generic inspection: unbox IsGenericType";
-    const auto* typeFlag = static_cast<const uint8_t*>(resolver.Unbox(typeResult.Target()));
-    if (!typeFlag) return Kind::Unknown;
-    return *typeFlag ? Kind::Generic : Kind::NonGeneric;
-}
-
-MonoRuntime::GenericMethodKind MonoRuntime::InspectMethodGenerics(MonoMethod* method, std::string& error) const
-{
-    MonoFeatureFault fault;
-    GenericMethodKind kind = GenericMethodKind::Unknown;
-    error.clear();
-    __try
-    {
-        kind = InspectMethodGenericsImpl(*this, method, fault);
-    }
-    __except (fault.Filter(GetExceptionInformation()))
-    {
-    }
-    if (fault.code) fault.Describe(fault.stage, error);
-    else if (kind == GenericMethodKind::Unknown)
-    {
-        error = fault.stage;
-        error += ": no usable reflection result";
-    }
-    return kind;
-}
-
-bool MonoRuntime::InspectOpenMethod(MonoMethod* method, bool& containsGenericParameters) const
-{
-    const uint64_t generation = Generation();
-    {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        if (m_openMethodGeneration != generation)
-        {
-            m_openMethodCache.clear();
-            m_openMethodGeneration = generation;
-        }
-        const auto cached = m_openMethodCache.find(method);
-        if (cached != m_openMethodCache.end())
-        {
-            containsGenericParameters = cached->second;
-            return true;
-        }
-    }
-    // MethodBase.ContainsGenericParameters also covers an open declaring type.
-    // IsGenericMethod alone would incorrectly reject constructed generic methods.
-    auto& resolver = MonoResolver::Instance();
-    MonoObject* reflection = resolver.MethodObject(Domain(), method);
-    if (!reflection) return false;
-    mono::ScopedGCHandle root(resolver, resolver.CreateGCHandle(reflection, true));
-    if (!root.value) return false;
-    for (MonoClass* klass = resolver.ObjectClass(root.Target()); klass; klass = resolver.ClassParent(klass))
-        for (MonoMethod* getter : resolver.EnumerateMethods(klass))
-        {
-            const char* name = resolver.MethodName(getter);
-            if (!name || strcmp(name, "get_ContainsGenericParameters") != 0 ||
-                !resolver.MethodParameters(getter).empty()) continue;
-            MonoObject* exception = nullptr;
-            MonoObject* result = resolver.Invoke(getter, root.Target(), nullptr, &exception);
-            if (exception || !result) return false;
-            mono::ScopedGCHandle resultRoot(resolver, resolver.CreateGCHandle(result, true));
-            if (!resultRoot.value) return false;
-            const auto* value = static_cast<const uint8_t*>(resolver.Unbox(resultRoot.Target()));
-            if (!value) return false;
-            containsGenericParameters = *value != 0;
-            {
-                std::lock_guard<std::mutex> lock(m_mutex);
-                if (Generation() != generation) return false;
-                m_openMethodCache[method] = containsGenericParameters;
-            }
-            return true;
-        }
-    return false;
 }
 
 std::string MonoRuntime::Status() const

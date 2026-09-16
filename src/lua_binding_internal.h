@@ -25,9 +25,9 @@ MonoMethod* LuaBridge_FindBestMethod(lua_State* state, MonoClass* klass, const c
 struct LuaMethodInvocation
 {
     const std::vector<uint64_t>* arguments = nullptr;
-    const std::vector<uint32_t>* handles = nullptr;
+    const std::vector<MonoGCHandle>* handles = nullptr;
     bool* entered = nullptr;
-    uint32_t* resultHandle = nullptr;
+    MonoGCHandle* resultHandle = nullptr;
     uint64_t* resultInt = nullptr;
     uint64_t* resultFloat = nullptr;
     void (*beforeInvoke)(void*) = nullptr;

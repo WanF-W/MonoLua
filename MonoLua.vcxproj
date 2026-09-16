@@ -115,6 +115,13 @@
     <ClCompile Include="minhook_src\hook.c" />
     <ClCompile Include="minhook_src\trampoline.c" />
     <ClCompile Include="src\dll_main.cpp" />
+    <ClCompile Include="src\mono_metadata_access.cpp" />
+    <ClCompile Include="src\mono_object_access.cpp" />
+    <ClCompile Include="src\lua_field_value.cpp" />
+    <ClCompile Include="src\lua_array_value.cpp" />
+    <ClCompile Include="src\bridge_session.cpp" />
+    <ClCompile Include="src\mono_hook_metadata.cpp" />
+    <ClCompile Include="src\mono_hook_registry.cpp" />
     <ClCompile Include="src\lua_binding_assembly.cpp" />
     <ClCompile Include="src\lua_binding_class.cpp" />
     <ClCompile Include="src\lua_binding_field.cpp" />
@@ -200,6 +207,12 @@
     <ClInclude Include="minhook_src\table64.h" />
     <ClInclude Include="minhook_src\trampoline.h" />
     <ClInclude Include="src\common.h" />
+    <ClInclude Include="src\bridge_lifecycle.h" />
+    <ClInclude Include="src\mono_native_call.h" />
+    <ClInclude Include="src\lua_value_memory.h" />
+    <ClInclude Include="src\bridge_session.h" />
+    <ClInclude Include="src\mono_hook_metadata.h" />
+    <ClInclude Include="src\mono_hook_internal.h" />
     <ClInclude Include="src\lua_cpp.h" />
     <ClInclude Include="src\lua_dump.h" />
     <ClInclude Include="src\hook_stub.h" />

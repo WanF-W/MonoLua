@@ -87,26 +87,11 @@ namespace
         return resolver.TypeDisplayName(resolver.ClassType(klass));
     }
 
-    int Instance_LengthForDisplay(lua_State* state)
-    {
-        lua_pushinteger(state, LuaBridge_ContainerLength(state, LuaBridge_GetInstanceObject(state, 1)));
-        return 1;
-    }
-
     int Instance_ToString(lua_State* state)
     {
         MonoObject* object = LuaBridge_GetInstanceObject(state, 1);
         MonoClass* klass = MonoResolver::Instance().ObjectClass(object);
         std::string name = FullTypeName(klass);
-        if (LuaBridge_IsArray(object) || LuaBridge_IsList(object))
-        {
-            lua_pushcfunction(state, Instance_LengthForDisplay);
-            lua_pushvalue(state, 1);
-            const int status = lua_pcall(state, 1, 1, 0);
-            LuaEngine::Instance().CheckHealthy();
-            if (status == LUA_OK) name += " (count=" + std::to_string(lua_tointeger(state, -1)) + ')';
-            lua_pop(state, 1);
-        }
         lua_pushfstring(state, "Instance: %s @ %p", name.c_str(),
                         static_cast<void*>(LuaBridge_GetInstanceObject(state, 1)));
         return 1;

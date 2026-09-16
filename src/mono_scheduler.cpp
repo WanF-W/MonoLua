@@ -10,6 +10,7 @@
 #include "lua_engine.h"
 #include "mono_feature_fault.h"
 #include "mono_scheduler_candidates.h"
+#include <exception>
 
 extern "C"
 {
@@ -87,15 +88,22 @@ namespace
 
     MonoMethod* FindSchedulerEntry(const MonoScheduler::Candidate& candidate, std::string& error)
     {
+        bridge_lifecycle::ClearNativeCallFault();
         MonoFeatureFault fault;
+        MonoMethod* result = nullptr;
         __try
         {
-            return FindSchedulerEntryImpl(candidate, error, fault);
+            result = FindSchedulerEntryImpl(candidate, error, fault);
         }
         __except (fault.Filter(GetExceptionInformation()))
         {
         }
-        fault.Describe(fault.stage, error);
+        if (ConsumeNativeCallFault(fault.stage, error)) return nullptr;
+        if (result && !fault.code) return result;
+        if (fault.code)
+            fault.Describe(fault.stage, error);
+        else if (error.empty())
+            error = "scheduler discovery failed";
         return nullptr;
     }
 
@@ -228,6 +236,12 @@ bool MonoScheduler::IsReady()
     return g_tick != nullptr;
 }
 
+bool MonoScheduler::IsMainThread()
+{
+    const DWORD thread = g_mainThread.load();
+    return thread != 0 && thread == GetCurrentThreadId();
+}
+
 void MonoScheduler::FlushDiagnostics()
 {
     auto& engine = LuaEngine::Instance();
@@ -262,18 +276,34 @@ void MonoScheduler::OnTick()
     }
     for (int reference : pending)
     {
-        LuaEngine::OutputCapture outputCapture;
-        lua_rawgeti(state, LUA_REGISTRYINDEX, reference);
-        const int status = lua_pcall(state, 0, 0, 0);
-        engine.CheckHealthy();
-        if (status != LUA_OK)
+        const int base = lua_gettop(state);
+        try
         {
-            const std::string message = LuaEngine::ErrorText(state, -1);
-            const std::string error =
-                std::string("[schedule] ") + message + '\n';
-            engine.EmitOutput(error.c_str());
-            lua_pop(state, 1);
+            LuaEngine::OutputCapture outputCapture;
+            lua_rawgeti(state, LUA_REGISTRYINDEX, reference);
+            const int status = lua_pcall(state, 0, 0, 0);
+            engine.CheckHealthy();
+            if (status != LUA_OK)
+            {
+                const std::string message = LuaEngine::ErrorText(state, -1);
+                const std::string error =
+                    std::string("[schedule] ") + message + '\n';
+                engine.EmitOutput(error.c_str());
+                lua_pop(state, 1);
+            }
         }
+        catch (const std::exception& exception)
+        {
+            char message[320]{};
+            sprintf_s(message, "[MonoLua][Scheduler] callback failed: %s\n",
+                      exception.what() ? exception.what() : "unknown C++ exception");
+            OutputDebugStringA(message);
+        }
+        catch (...)
+        {
+            OutputDebugStringA("[MonoLua][Scheduler] callback failed: unknown C++ exception\n");
+        }
+        lua_settop(state, base);
         luaL_unref(state, LUA_REGISTRYINDEX, reference);
     }
 }

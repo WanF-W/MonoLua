@@ -86,8 +86,8 @@ class MonoResolver
     MonoType* ClassType(MonoClass* klass) const;
     MonoObject* TypeObject(MonoDomain* domain, MonoType* type) const;
     MonoType* EnumBaseType(MonoClass* klass) const;
-    void ReadField(MonoObject* object, MonoClassField* field, void* value) const;
-    void WriteField(MonoObject* object, MonoClassField* field, void* value) const;
+    bool ReadField(MonoObject* object, MonoClassField* field, void* value) const;
+    bool WriteField(MonoObject* object, MonoClassField* field, void* value) const;
     bool ReadStaticField(MonoDomain* domain, MonoClassField* field, void* value) const;
     bool WriteStaticField(MonoDomain* domain, MonoClassField* field, void* value) const;
     MonoDomain* ObjectDomain(MonoObject* object) const;
@@ -101,9 +101,9 @@ class MonoResolver
     bool IsValidObjectHeader(MonoObject* object) const;
     bool ObjectIsInstanceOf(MonoObject* object, MonoClass* klass) const;
     MonoClass* ObjectClass(MonoObject* object) const;
-    uint32_t CreateGCHandle(MonoObject* object, bool pinned = false) const;
-    MonoObject* GCHandleTarget(uint32_t handle) const;
-    void FreeGCHandle(uint32_t handle) const;
+    MonoGCHandle CreateGCHandle(MonoObject* object, bool pinned = false) const;
+    MonoObject* GCHandleTarget(MonoGCHandle handle) const;
+    void FreeGCHandle(MonoGCHandle handle) const;
 
   private:
     MonoResolver() = default;
@@ -187,6 +187,9 @@ class MonoResolver
     using FnGCHandleNew = uint32_t (*)(MonoObject*, int);
     using FnGCHandleGetTarget = MonoObject* (*)(uint32_t);
     using FnGCHandleFree = void (*)(uint32_t);
+    using FnGCHandleNewV2 = MonoGCHandle (*)(MonoObject*, int);
+    using FnGCHandleGetTargetV2 = MonoObject* (*)(MonoGCHandle);
+    using FnGCHandleFreeV2 = void (*)(MonoGCHandle);
 
     // 模块与 Root Domain 都由目标游戏拥有，Resolver 只保存借用指针。
     HMODULE m_module = nullptr;
@@ -269,6 +272,9 @@ class MonoResolver
     FnGCHandleNew m_gcHandleNew = nullptr;
     FnGCHandleGetTarget m_gcHandleGetTarget = nullptr;
     FnGCHandleFree m_gcHandleFree = nullptr;
+    FnGCHandleNewV2 m_gcHandleNewV2 = nullptr;
+    FnGCHandleGetTargetV2 m_gcHandleGetTargetV2 = nullptr;
+    FnGCHandleFreeV2 m_gcHandleFreeV2 = nullptr;
     // optional 缺失不会阻止初始化，但必须出现在状态文本中。
     std::vector<std::string> m_missingOptional;
     std::vector<std::string> m_missingRequired;

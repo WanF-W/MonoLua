@@ -143,7 +143,7 @@ bool LuaBridge_TryPushInstance(lua_State* state, MonoObject* object, std::string
     return true;
 }
 
-void LuaBridge_PushInstanceHandle(lua_State* state, uint32_t& handle)
+void LuaBridge_PushInstanceHandle(lua_State* state, MonoGCHandle& handle)
 {
     if (!handle)
     {

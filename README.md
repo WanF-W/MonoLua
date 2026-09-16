@@ -385,7 +385,7 @@ print(manager:static_call("GetCurrent"))
 manager:static_call("SetDifficulty", 2)
 ```
 
-`static_call()` 会根据 Lua 参数选择静态方法重载，并沿父类查找。
+`static_call()` 会根据 Lua 参数选择静态方法重载，并沿父类查找。同一声明类中出现多个同分候选时会报告歧义；请使用 `get_method()` 明确参数类型，再通过 `Method:call()` 调用。
 
 <a name="class-static-field"></a>
 #### 🗂️ 静态字段
@@ -459,7 +459,7 @@ local getLevel = class:get_method("GetLevel")
 print(getLevel:call(player))
 ```
 
-`instance:call(name, ...)` 根据 Lua 参数选择实例方法重载。`void` 方法没有 Lua 返回值。
+`instance:call(name, ...)` 根据 Lua 参数选择方法重载；同分候选会报告歧义，可通过 `get_method()` 明确参数类型。`void` 方法没有 Lua 返回值。
 
 <a name="instance-fields"></a>
 #### 📝 实例字段
@@ -499,7 +499,7 @@ items:dump()
 | `method:get_name()` | 方法名 |
 | `method:get_class()` | 声明方法的 Class |
 | `method:get_signature()` | 方法签名 |
-| `method:get_address()` | 已编译的原生入口地址，无法取得时为 `nil` |
+| `method:get_address()` | 显式请求 JIT 编译并返回原生入口地址，无法取得时为 `nil` |
 | `method:call(instance, ...)` | 精确调用方法 |
 | `method:hook(callback)` | 安装 Lua Hook |
 | `method:is_hooked()` | 查询 Hook 状态 |
@@ -514,6 +514,8 @@ local getCurrent = class:get_method("GetCurrent")
 print(getLevel:call(player))
 print(getCurrent:call())
 ```
+
+`get_address()` 才会请求 JIT 编译；打印 `Method` 或读取其元数据不会隐式触发编译。
 
 <a name="api-field"></a>
 ### 🏷️ `Field`

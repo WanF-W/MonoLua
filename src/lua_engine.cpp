@@ -1,10 +1,13 @@
-// One serialized Lua VM. Ordinary Lua errors unwind C++ owners; native faults end the session.
+// 单个 Lua VM 串行执行；普通 Lua/功能错误只影响当前命令，无法安全展开的
+// Hook 或工作线程原生故障才会隔离会话。
 #include "lua_engine.h"
 #include "lua_bridge.h"
 #include <cctype>
 #include <charconv>
 #include <cstdarg>
 #include <algorithm>
+#include <cstdio>
+#include <exception>
 
 extern "C"
 {
@@ -16,6 +19,22 @@ extern "C"
 namespace
 {
     thread_local LuaEngine::OutputCapture* g_outputCapture = nullptr;
+
+    void InvokeOutputCallbackSeh(OutputCallback& callback, const char* text) noexcept
+    {
+        __try
+        {
+            callback(text);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            OutputDebugStringA("[MonoLua] output callback raised a native exception\n");
+        }
+    }
+    void ResetOutputCaptureAfterNativeFault() noexcept
+    {
+        g_outputCapture = nullptr;
+    }
     constexpr const char* ErrorMetatable = "MonoLua.Error";
     struct TaggedError { protocol::ErrorCategory category; };
     int ErrorToString(lua_State* state)
@@ -25,8 +44,8 @@ namespace
     }
     int ThrowTaggedError(lua_State* state, protocol::ErrorCategory category)
     {
-        // The message is already on top. Keeping the tag on the error object means
-        // pcall/error preserves it; caught errors cannot contaminate a later failure.
+        // 消息已经在栈顶。把分类标签保存在错误对象上，pcall/error 可以保留它，
+        // 已捕获的错误不会污染后续错误。
         auto* error = static_cast<TaggedError*>(lua_newuserdatauv(state, sizeof(TaggedError), 1));
         error->category = category;
         lua_pushvalue(state, -2);
@@ -95,17 +114,28 @@ LuaEngine::OutputCapture::OutputCapture() : previous(g_outputCapture)
 LuaEngine::OutputCapture::~OutputCapture()
 {
     g_outputCapture = previous;
-    auto& engine = LuaEngine::Instance();
-    if (!engine.IsFaulted() && !text.empty() && engine.m_outputCb) engine.m_outputCb(text.c_str());
+    try
+    {
+        auto& engine = LuaEngine::Instance();
+        if (!engine.IsFaulted() && !text.empty() && engine.m_outputCb)
+        {
+            InvokeOutputCallbackSeh(engine.m_outputCb, text.c_str());
+        }
+    }
+    catch (...)
+    {
+        OutputDebugStringA("[MonoLua] output callback failed\n");
+    }
 }
 
 void LuaEngine::EmitOutput(const char* text)
 {
+    // 会话隔离后不再进入 Lua；错误报告仍可通过独立的管道回调送到 Lune。
     if (!text) return;
     if (g_outputCapture)
     {
-        // One command can emit many bounded dumps. Bound the batch as well so it
-        // cannot grow past the transport limit and disappear as a single log.
+        // 一条命令可能输出多个受限 dump；同时限制整批大小，避免超过传输
+        // 上限后整条日志被丢弃。
         constexpr size_t budget = 1024 * 1024;
         auto& capture = *g_outputCapture;
         if (capture.truncated) return;
@@ -119,7 +149,16 @@ void LuaEngine::EmitOutput(const char* text)
         }
     }
     else if (m_outputCb)
-        m_outputCb(text);
+    {
+        try
+        {
+            InvokeOutputCallbackSeh(m_outputCb, text);
+        }
+        catch (...)
+        {
+            OutputDebugStringA("[MonoLua] output callback failed\n");
+        }
+    }
 }
 
 LuaEngine& LuaEngine::Instance()
@@ -130,33 +169,70 @@ LuaEngine& LuaEngine::Instance()
 
 LuaEngine::~LuaEngine()
 {
-    if (!bridge_lifecycle::g_processTerminating.load() && !IsFaulted()) Shutdown();
+    if (!bridge_lifecycle::g_processTerminating.load() && !IsFaulted())
+    {
+        try
+        {
+            ShutdownSeh();
+        }
+        catch (...)
+        {
+            OutputDebugStringA("[MonoLua] Lua cleanup failed\n");
+        }
+    }
 }
 
 void LuaEngine::Abort() noexcept
 {
     m_initialized.store(false);
-    if (!bridge_lifecycle::g_sessionFaulted.exchange(true) && m_onFault) m_onFault();
+    bridge_lifecycle::g_sessionFaulted.store(true);
 }
 
-int LuaEngine::HandleNativeFault() noexcept
+void LuaEngine::ShutdownSeh()
 {
-    // Filters run before stack unwinding: release native locks, but retain Mono roots
-    // and the VM instead of invoking a potentially damaged runtime during cleanup.
+    __try
+    {
+        Shutdown();
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        OutputDebugStringA("[MonoLua] Lua cleanup raised a native exception\n");
+    }
+}
+
+int LuaEngine::HandleNativeFault(EXCEPTION_POINTERS* info) noexcept
+{
+    // A fault escaping the native-operation boundary may have bypassed Lua's
+    // errorJmp/CallInfo restoration. Never reuse that VM.
+    int expected = 0;
+    if (m_nativeFaultState.compare_exchange_strong(expected, 1))
+    {
+        const auto* record = info ? info->ExceptionRecord : nullptr;
+        sprintf_s(m_nativeFaultMessage,
+            "%s: native exception 0x%08lX at %p; MonoLua session quarantined",
+            bridge_lifecycle::g_nativeStage, record ? record->ExceptionCode : 0,
+            record ? record->ExceptionAddress : nullptr);
+        OutputDebugStringA(m_nativeFaultMessage);
+        OutputDebugStringA("\n");
+        m_nativeFaultState.store(3);
+    }
+    ResetOutputCaptureAfterNativeFault();
     Abort();
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
 void LuaEngine::CheckHealthy() const
 {
-    // Propagate a nested Hook fault to the enclosing native execution boundary without touching Lua.
+    // 把嵌套 Hook 故障传给外层原生边界，不直接触碰 Lua。
     if (IsFaulted()) RaiseException(bridge_lifecycle::SESSION_FAULT_CODE, EXCEPTION_NONCONTINUABLE, 0, nullptr);
 }
 
 LuaEngine::ExecutionError LuaEngine::GetLastError() const
 {
-    if (IsFaulted())
-        return {protocol::ErrorCategory::Mono, -1, "native exception; MonoLua session stopped"};
+    const int nativeFault = m_nativeFaultState.load();
+    if (nativeFault == 3 || IsFaulted())
+        return {protocol::ErrorCategory::Mono, -1, m_nativeFaultMessage[0]
+            ? m_nativeFaultMessage : "native exception; MonoLua session quarantined"};
     std::lock_guard<std::recursive_mutex> lock(m_luaMutex);
     return m_lastError;
 }
@@ -168,21 +244,36 @@ void LuaEngine::SetLastError(protocol::ErrorCategory category, int32_t line, con
     m_lastError = {category, line, message ? message : "unknown error"};
 }
 
-bool LuaEngine::Init(OutputCallback output, void (*onFault)())
+bool LuaEngine::Init(OutputCallback output)
 {
     std::lock_guard<std::recursive_mutex> lock(m_luaMutex);
     if (IsFaulted()) return false;
     if (IsInitialized()) return true;
-    m_onFault = onFault;
     m_L = luaL_newstate();
     if (!m_L) return false;
-    m_outputCb = std::move(output);
-    luaL_openlibs(m_L);
-    lua_pushcfunction(m_L, LuaPrint);
-    lua_setglobal(m_L, "print");
-    if (!LuaBridge_Init(m_L))
+    try
     {
-        lua_close(m_L);
+        m_outputCb = std::move(output);
+        luaL_openlibs(m_L);
+        lua_pushcfunction(m_L, LuaPrint);
+        lua_setglobal(m_L, "print");
+        if (!LuaBridge_Init(m_L))
+        {
+            lua_close(m_L);
+            m_L = nullptr;
+            m_outputCb = nullptr;
+            return false;
+        }
+    }
+    catch (...)
+    {
+        try
+        {
+            if (m_L) lua_close(m_L);
+        }
+        catch (...)
+        {
+        }
         m_L = nullptr;
         m_outputCb = nullptr;
         return false;
@@ -208,6 +299,7 @@ bool LuaEngine::ExecuteBuffer(const char* buffer, size_t length, const char* nam
     if (IsFaulted()) return false;
     std::lock_guard<std::recursive_mutex> lock(m_luaMutex);
     if (IsFaulted()) return false;
+    bridge_lifecycle::ClearNativeCallFault();
     m_lastError = {};
     if (!IsInitialized() || !m_L)
     {
@@ -219,19 +311,68 @@ bool LuaEngine::ExecuteBuffer(const char* buffer, size_t length, const char* nam
         m_lastError.message = "empty Lua input";
         return false;
     }
-    return RunProtected(buffer, length, name, includeLine);
+    const bool success = RunProtected(buffer, length, name, includeLine);
+    // SEH 处理器只写入固定缓冲区，不能在过滤器里操作 std::string。
+    // 在这里把当前命令的原生故障转换成正常的结构化错误，避免 Lune
+    // 收到空错误后误以为连接异常。
+    const int nativeFaultState = m_nativeFaultState.load();
+    if ((nativeFaultState == 3 || IsFaulted()) && m_lastError.message.empty())
+    {
+        try
+        {
+            m_lastError.category = protocol::ErrorCategory::Mono;
+            m_lastError.line = -1;
+            m_lastError.message = m_nativeFaultMessage[0]
+                ? m_nativeFaultMessage
+                : "native exception; MonoLua session quarantined";
+        }
+        catch (...)
+        {
+            // 错误文本分配失败也不能把命令线程推出工作循环；SendError
+            // 会在没有文本时使用固定回退消息。
+            m_lastError.category = protocol::ErrorCategory::Mono;
+            m_lastError.line = -1;
+        }
+    }
+    if (bridge_lifecycle::g_nativeCallFaulted)
+    {
+        char message[128]{};
+        if (bridge_lifecycle::g_nativeCallFaultCode)
+            sprintf_s(message, "native exception during tool operation (0x%08lX)",
+                      bridge_lifecycle::g_nativeCallFaultCode);
+        else
+            sprintf_s(message, "native call raised a C++ exception during tool operation");
+        m_lastError.category = protocol::ErrorCategory::Mono;
+        m_lastError.line = -1;
+        m_lastError.message = message;
+        bridge_lifecycle::ClearNativeCallFault();
+        return false;
+    }
+    return success;
 }
 
-bool LuaEngine::RunProtected(const char* buffer, size_t length, const char* name, bool includeLine)
+bool LuaEngine::RunBufferSeh(const char* buffer, size_t length, const char* name, bool includeLine)
 {
-    // Keep SEH outside the C++ locals in RunBuffer. An escaped native fault skips Lua's own
-    // call-frame/error-chain restoration, so no lua_settop or lua_close is safe afterwards.
     __try
     {
         return RunBuffer(buffer, length, name, includeLine);
     }
-    __except (HandleNativeFault())
+    __except (HandleNativeFault(GetExceptionInformation()))
     {
+        return false;
+    }
+}
+
+bool LuaEngine::RunProtected(const char* buffer, size_t length, const char* name, bool includeLine)
+{
+    try
+    {
+        return RunBufferSeh(buffer, length, name, includeLine);
+    }
+    catch (...)
+    {
+        // An exception outside lua_pcall also lacks a proven VM recovery path.
+        HandleNativeFault(nullptr);
         return false;
     }
 }
@@ -268,7 +409,7 @@ bool LuaEngine::RunBuffer(const char* buffer, size_t length, const char* name, b
 
 bool LuaEngine::ExecuteString(const char* code, size_t length)
 {
-    // Unified Lune displays line numbers for files only.
+    // Lune 统一只为文件显示行号。
     return ExecuteBuffer(code, length, "=lune", false);
 }
 
@@ -285,7 +426,7 @@ bool LuaEngine::ExecuteFile(const char* path)
     std::vector<wchar_t> widePath(static_cast<size_t>(length));
     if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, widePath.data(), length) <= 0)
         return error("failed to convert file path");
-    // Disk I/O runs outside the Lua mutex; ExecuteBuffer rechecks session state.
+    // 磁盘 I/O 在 Lua 锁外执行；ExecuteBuffer 会再次检查会话状态。
     std::vector<char> source;
     {
         struct FileHandle
@@ -316,7 +457,7 @@ bool LuaEngine::ExecuteFile(const char* path)
     const char* name = path;
     for (const char* current = path; *current; ++current)
         if (*current == '/' || *current == '\\') name = current + 1;
-    // '=' makes this a literal source name rather than Lua source text.
+    // '=' 表示字面量源名称，而不是 Lua 源代码文本。
     const std::string chunkName = std::string("=") + name;
     return ExecuteBuffer(source.empty() ? "" : source.data(), source.size(), chunkName.c_str(), true);
 }

@@ -45,7 +45,7 @@ namespace
         const auto* userdata = LuaBridge_CheckMethod(state, 1);
         auto& resolver = MonoResolver::Instance();
         const std::string signature = resolver.MethodSignature(userdata->method);
-        lua_pushfstring(state, "Method: %s @ %p", signature.c_str(), resolver.CompileMethod(userdata->method));
+        lua_pushfstring(state, "Method: %s @ %p", signature.c_str(), static_cast<void*>(userdata->method));
         return 1;
     }
 

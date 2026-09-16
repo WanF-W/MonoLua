@@ -23,20 +23,4 @@
 #include <utility>
 #include <vector>
 
-namespace bridge_lifecycle
-{
-    // Tool-initiated managed calls must never establish the Unity thread identity.
-    inline thread_local unsigned g_managedCallDepth = 0;
-    struct ManagedCallScope
-    {
-        const unsigned previous = g_managedCallDepth;
-        ManagedCallScope() { ++g_managedCallDepth; }
-        ~ManagedCallScope() { g_managedCallDepth = previous; }
-        ManagedCallScope(const ManagedCallScope&) = delete;
-        ManagedCallScope& operator=(const ManagedCallScope&) = delete;
-    };
-    inline constexpr DWORD SESSION_FAULT_CODE = 0xE04D4C01;
-    // Process detach must not wait for threads that Windows may already have terminated.
-    inline std::atomic<bool> g_processTerminating{false};
-    inline std::atomic<bool> g_sessionFaulted{false};
-} // namespace bridge_lifecycle
+#include "bridge_lifecycle.h"

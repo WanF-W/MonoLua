@@ -11,6 +11,7 @@
 #include "mono_metadata.h"
 #include "mono_resolver.h"
 #include "mono_runtime.h"
+#include "mono_scheduler.h"
 #include "unity_object_query.h"
 #include "lua_engine.h"
 #include <sstream>
@@ -270,6 +271,12 @@ namespace
     int Class_FindUnityObjects(lua_State* state)
     {
         const LuaClassUD* userdata = LuaBridge_CheckClass(state, 1);
+        if (!MonoScheduler::IsMainThread())
+        {
+            lua_pushnil(state);
+            lua_pushliteral(state, "find_unity_objects must be called on the Unity main thread via mono.schedule()");
+            return 2;
+        }
         mono::GCHandles handles;
         std::string error;
         const bool found = UnityObjectQuery::FindObjectsOfType(userdata->klass, handles, error);

@@ -2,7 +2,7 @@
 #include "common.h"
 #include <cstdio>
 
-// 调度器候选查找、元数据准备和原生 Hook 安装使用这条局部边界。
+// 调度器候选、元数据准备、Unity 对象查询和原生 Hook 安装使用这条局部边界。
 // 功能级错误不能调用 LuaEngine::Abort，也不能关闭通信管道。
 struct MonoFeatureFault
 {
@@ -13,7 +13,7 @@ struct MonoFeatureFault
 
     int Filter(EXCEPTION_POINTERS* info) noexcept
     {
-        if (bridge_lifecycle::g_sessionFaulted.load() || !info || !info->ExceptionRecord)
+        if (!info || !info->ExceptionRecord)
             return EXCEPTION_CONTINUE_SEARCH;
         const auto* record = info->ExceptionRecord;
         // 普通元数据查询只恢复读取异常；调度器安装还要把 MinHook
@@ -40,3 +40,19 @@ struct MonoFeatureFault
         OutputDebugStringA("\n");
     }
 };
+
+inline bool ConsumeNativeCallFault(const char* phase, std::string& error)
+{
+    if (!bridge_lifecycle::g_nativeCallFaulted) return false;
+    char message[256]{};
+    if (bridge_lifecycle::g_nativeCallFaultCode)
+        sprintf_s(message, "%s: native exception 0x%08lX", phase ? phase : "native execution",
+                  bridge_lifecycle::g_nativeCallFaultCode);
+    else
+        sprintf_s(message, "%s: native call raised a C++ exception", phase ? phase : "native execution");
+    error = message;
+    bridge_lifecycle::ClearNativeCallFault();
+    OutputDebugStringA(message);
+    OutputDebugStringA("\n");
+    return true;
+}

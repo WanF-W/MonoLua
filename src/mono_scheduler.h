@@ -18,6 +18,7 @@ namespace MonoScheduler
     bool AutoSetTick(std::string& error);
     MonoMethod* GetTick();
     bool IsReady();
+    bool IsMainThread();
     // READY 发送后再开放调度器诊断输出，避免日志插入握手帧之前。
     void FlushDiagnostics();
     void OnTick();

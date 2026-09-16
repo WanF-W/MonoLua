@@ -18,12 +18,11 @@ namespace MonoHook
     bool IsHooked(MonoMethod* method);
     // 调度策略由调用方负责；Hook 层只调用传入的 tick 回调。
     bool InstallTick(MonoMethod* method, void (*callback)(), std::string& error);
-    bool InstallMainThreadProbe(MonoMethod* method, void (*callback)(), std::string& error);
     // 调度器固定候选绕过反射检查，但仍执行通用 ABI 校验。
     bool InstallSchedulerEntry(MonoMethod* method, const MonoScheduler::Candidate& candidate,
                                void (*callback)(), bool probe, std::string& error);
     void UnhookAll();
     void InvalidateMetadata();
     void DrainDeferred();
-    void Shutdown();
+    bool Shutdown();
 } // namespace MonoHook

@@ -7,14 +7,17 @@
 #include "unity_object_query.h"
 
 #include "mono_metadata.h"
+#include "mono_feature_fault.h"
 #include "mono_resolver.h"
 #include "mono_runtime.h"
 
 namespace UnityObjectQuery
 {
-    bool FindObjectsOfType(MonoClass* klass, mono::GCHandles& handles, std::string& error)
+    static bool FindObjectsOfTypeImpl(MonoClass* klass, mono::GCHandles& handles,
+                                      std::string& error, MonoFeatureFault& fault)
     {
         error.clear();
+        bridge_lifecycle::NativeStageScope stage("Unity object query");
         if (!klass)
         {
             error = "class is null";
@@ -22,11 +25,13 @@ namespace UnityObjectQuery
         }
 
         auto& resolver = MonoResolver::Instance();
+        fault.stage = "Unity object query: array exports";
         if (!resolver.CanReadArrays())
         {
             error = "Mono array reading exports are unavailable";
             return false;
         }
+        fault.stage = "Unity object query: UnityEngine.Object class";
         MonoClass* unityObject = MonoRuntime::Instance().FindClass("UnityEngine", "Object");
         if (!unityObject)
         {
@@ -51,6 +56,7 @@ namespace UnityObjectQuery
 
         // TypeObject 是 Mono 管理的对象。暂时保留一个强引用，直到反射调用
         // 完成，避免中间的元数据查询或运行时调用触发 GC 后指针失效。
+        fault.stage = "Unity object query: System.Type";
         MonoObject* typeObject =
             resolver.TypeObject(MonoRuntime::Instance().Domain(), resolver.ClassType(klass));
         if (!typeObject)
@@ -73,6 +79,7 @@ namespace UnityObjectQuery
 
         MonoMethod* findMethod = nullptr;
         bool usesSortMode = false;
+        fault.stage = "Unity object query: FindObjectsOfType overload";
         for (MonoMethod* method : resolver.EnumerateMethods(unityObject))
         {
             const char* name = resolver.MethodName(method);
@@ -95,6 +102,7 @@ namespace UnityObjectQuery
         // 取代旧入口。None 的枚举值为 0，不依赖 Unity 私有布局。
         if (!findMethod)
         {
+            fault.stage = "Unity object query: FindObjectsByType overload";
             for (MonoMethod* method : resolver.EnumerateMethods(unityObject))
             {
                 const char* name = resolver.MethodName(method);
@@ -121,6 +129,8 @@ namespace UnityObjectQuery
         void* parameters[2] = {typeObject, usesSortMode ? static_cast<void*>(&sortModeNone)
                                                         : static_cast<void*>(&includeInactive)};
         MonoObject* exception = nullptr;
+        fault.stage = usesSortMode ? "Unity object query: invoke FindObjectsByType"
+                                   : "Unity object query: invoke FindObjectsOfType";
         MonoObject* result = resolver.Invoke(findMethod, nullptr, parameters, &exception);
         if (exception)
         {
@@ -130,6 +140,7 @@ namespace UnityObjectQuery
         }
         if (!result) return true;
 
+        fault.stage = "Unity object query: read result array";
         mono::ScopedGCHandle arrayHandle(resolver, resolver.CreateGCHandle(result, true));
         if (!arrayHandle.value)
         {
@@ -144,7 +155,7 @@ namespace UnityObjectQuery
             array = reinterpret_cast<MonoArray*>(arrayHandle.Target());
             MonoObject* object = resolver.ArrayElement(array, index);
             if (!object) continue;
-            const uint32_t objectHandle = resolver.CreateGCHandle(object);
+            const MonoGCHandle objectHandle = resolver.CreateGCHandle(object);
             if (!objectHandle)
             {
                 error = "failed to retain a Unity object result";
@@ -153,5 +164,27 @@ namespace UnityObjectQuery
             handles.values.push_back(objectHandle);
         }
         return true;
+    }
+
+    bool FindObjectsOfType(MonoClass* klass, mono::GCHandles& handles, std::string& error)
+    {
+        bridge_lifecycle::ClearNativeCallFault();
+        MonoFeatureFault fault;
+        bool success = false;
+        fault.catchAllMemoryAccess = true;
+        __try
+        {
+            success = FindObjectsOfTypeImpl(klass, handles, error, fault);
+        }
+        __except (fault.Filter(GetExceptionInformation()))
+        {
+        }
+        if (ConsumeNativeCallFault(fault.stage, error)) return false;
+        if (success) return true;
+        if (fault.code)
+            fault.Describe(fault.stage, error);
+        else if (error.empty())
+            error = "Unity object query failed";
+        return false;
     }
 } // namespace UnityObjectQuery

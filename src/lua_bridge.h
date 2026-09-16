@@ -50,7 +50,7 @@ struct LuaFieldUD
 
 struct LuaInstanceUD
 {
-    uint32_t gcHandle = 0;
+    MonoGCHandle gcHandle = 0;
     uint64_t generation = 0;
 };
 
@@ -73,7 +73,7 @@ void LuaBridge_PushInstance(lua_State* state, MonoObject* object);
 bool LuaBridge_TryPushInstance(lua_State* state, MonoObject* object, std::string& error);
 bool LuaBridge_TryToString(lua_State* state, int index, std::string& text);
 // Transfers ownership only after userdata initialization succeeds; clears the source handle.
-void LuaBridge_PushInstanceHandle(lua_State* state, uint32_t& handle);
+void LuaBridge_PushInstanceHandle(lua_State* state, MonoGCHandle& handle);
 LuaInstanceUD* LuaBridge_CheckInstance(lua_State* state, int index);
 bool LuaBridge_TryGetInstanceObject(lua_State* state, int index, MonoObject*& object);
 MonoObject* LuaBridge_GetInstanceObject(lua_State* state, int index);

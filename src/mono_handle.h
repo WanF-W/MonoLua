@@ -1,4 +1,4 @@
-// Temporary Mono roots. Ownership can be transferred to Lua userdata explicitly.
+// 临时 Mono 根；所有权可以显式转交给 Lua userdata。
 #pragma once
 #include "mono_resolver.h"
 
@@ -7,9 +7,9 @@ namespace mono
     struct ScopedGCHandle
     {
         MonoResolver& resolver;
-        uint32_t value;
+        MonoGCHandle value;
 
-        ScopedGCHandle(MonoResolver& owner, uint32_t handle) : resolver(owner), value(handle) {}
+        ScopedGCHandle(MonoResolver& owner, MonoGCHandle handle) : resolver(owner), value(handle) {}
         ScopedGCHandle(const ScopedGCHandle&) = delete;
         ScopedGCHandle& operator=(const ScopedGCHandle&) = delete;
         ~ScopedGCHandle()
@@ -22,7 +22,7 @@ namespace mono
 
     struct GCHandles
     {
-        std::vector<uint32_t> values;
+        std::vector<MonoGCHandle> values;
 
         explicit GCHandles(size_t count = 0) : values(count, 0) {}
         GCHandles(const GCHandles&) = delete;
@@ -30,7 +30,7 @@ namespace mono
         ~GCHandles()
         {
             if (bridge_lifecycle::g_sessionFaulted.load()) return;
-            for (uint32_t handle : values)
+            for (MonoGCHandle handle : values)
                 MonoResolver::Instance().FreeGCHandle(handle);
         }
     };
