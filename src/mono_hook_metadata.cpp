@@ -142,10 +142,9 @@ static GenericMethodKind InspectGenericsSafely(
         entry.isStatic = (resolver.MethodFlags(method) & METHOD_ATTRIBUTE_STATIC) != 0;
         if (candidate)
         {
-            // 只有调度器内置描述可以直接确定入口不是泛型方法；
+            // 默认调度器描述可以直接确定入口不是泛型方法；
             // 不检查程序集文件名，也不要求无关的实现标志。
-            if (candidate != &MonoScheduler::ExecuteTasks && candidate != &MonoScheduler::DeltaTime &&
-                candidate != &MonoScheduler::FrameCount && candidate != &MonoScheduler::ObjectName)
+            if (candidate != &MonoScheduler::DeltaTime)
             {
                 error = "unknown built-in scheduler candidate";
                 return false;
@@ -219,7 +218,7 @@ static GenericMethodKind InspectGenericsSafely(
         if (internalCall)
         {
             fault.stage = "hook metadata: InternalCall ABI";
-            // 调度器固定描述已经确定完整的 Windows x64 形状，
+            // 默认 tick 的固定描述已经确定完整的 Windows x64 形状，
             // 也包含实例 getter 的隐含 this 槽位。固定路径不再读取命名空间或
             // 反射信息；任意用户 InternalCall 仍限制为 UnityEngine.Time 的
             // 静态标量 ABI。

@@ -52,6 +52,5 @@ namespace mono_hook_detail
     extern std::vector<int> g_deferredLuaRefs;
     extern bool g_metadataCleanupPending;
     extern HookEntry* g_tickEntry;
-    extern HookEntry* g_probeEntry;
     bool HookStubsActive();
 }

@@ -151,6 +151,7 @@ BOOL CreateTrampolineFunction(PTRAMPOLINE ct)
 
             // Modify the RIP relative address.
             PUINT32 pRelAddr;
+            INT64 displacement;
 
             // Avoid using memcpy to reduce the footprint.
 #ifndef ALLOW_INTRINSICS
@@ -162,8 +163,13 @@ BOOL CreateTrampolineFunction(PTRAMPOLINE ct)
 
             // Relative address is stored at (instruction length - immediate value length - 4).
             pRelAddr = (PUINT32)(instBuf + hs.len - ((hs.flags & 0x3C) >> 2) - 4);
-            *pRelAddr
-                = (UINT32)((pOldInst + hs.len + (INT32)hs.disp.disp32) - (pNewInst + hs.len));
+            displacement = (INT64)pOldInst + hs.len + (INT32)hs.disp.disp32
+                         - ((INT64)pNewInst + hs.len);
+            // A nearby allocation does not guarantee that a relocated RIP-relative
+            // operand is reachable. Never silently truncate an out-of-range disp32.
+            if (displacement < (-2147483647LL - 1) || displacement > 2147483647LL)
+                return FALSE;
+            *pRelAddr = (UINT32)(INT32)displacement;
 
             // Complete the function if JMP (FF /4).
             if (hs.opcode == 0xFF && hs.modrm_reg == 4)
@@ -313,6 +319,14 @@ BOOL CreateTrampolineFunction(PTRAMPOLINE ct)
     jmp.address = (ULONG_PTR)ct->pDetour;
 
     ct->pRelay = (LPBYTE)ct->pTrampoline + newPos;
+    {
+        // The entry patch uses rel32, including the hot-patch-above variant.
+        INT64 patchEnd = (INT64)(ULONG_PTR)ct->pTarget
+                      + (ct->patchAbove ? 0 : sizeof(JMP_REL));
+        INT64 displacement = (INT64)(ULONG_PTR)ct->pRelay - patchEnd;
+        if (displacement < (-2147483647LL - 1) || displacement > 2147483647LL)
+            return FALSE;
+    }
     memcpy(ct->pRelay, &jmp, sizeof(jmp));
 #endif
 

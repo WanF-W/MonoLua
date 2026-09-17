@@ -35,6 +35,10 @@
 // Max range for seeking a memory block. (= 1024MB)
 #define MAX_MEMORY_RANGE 0x40000000
 
+// Fallback for crowded Mono JIT regions. Leave 64KB below the rel32 limit
+// for block offsets and patch instructions; relocation is checked separately.
+#define FALLBACK_MEMORY_RANGE 0x7FFF0000
+
 // Memory protection flags to check the executable address.
 #define PAGE_EXECUTE_FLAGS \
     (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)
@@ -148,7 +152,7 @@ static LPVOID FindNextFreeRegion(LPVOID pAddress, LPVOID pMaxAddr, DWORD dwAlloc
 #endif
 
 //-------------------------------------------------------------------------
-static PMEMORY_BLOCK GetMemoryBlock(LPVOID pOrigin)
+static PMEMORY_BLOCK GetMemoryBlockInRange(LPVOID pOrigin, ULONG_PTR range)
 {
     PMEMORY_BLOCK pBlock;
 #if defined(_M_X64) || defined(__x86_64__)
@@ -160,12 +164,12 @@ static PMEMORY_BLOCK GetMemoryBlock(LPVOID pOrigin)
     minAddr = (ULONG_PTR)si.lpMinimumApplicationAddress;
     maxAddr = (ULONG_PTR)si.lpMaximumApplicationAddress;
 
-    // pOrigin ± 512MB
-    if ((ULONG_PTR)pOrigin > MAX_MEMORY_RANGE && minAddr < (ULONG_PTR)pOrigin - MAX_MEMORY_RANGE)
-        minAddr = (ULONG_PTR)pOrigin - MAX_MEMORY_RANGE;
+    // Clamp the requested search window to application address space.
+    if ((ULONG_PTR)pOrigin > range && minAddr < (ULONG_PTR)pOrigin - range)
+        minAddr = (ULONG_PTR)pOrigin - range;
 
-    if (maxAddr > (ULONG_PTR)pOrigin + MAX_MEMORY_RANGE)
-        maxAddr = (ULONG_PTR)pOrigin + MAX_MEMORY_RANGE;
+    if (maxAddr > (ULONG_PTR)pOrigin && maxAddr - (ULONG_PTR)pOrigin > range)
+        maxAddr = (ULONG_PTR)pOrigin + range;
 
     // Make room for MEMORY_BLOCK_SIZE bytes.
     maxAddr -= MEMORY_BLOCK_SIZE - 1;
@@ -247,7 +251,12 @@ static PMEMORY_BLOCK GetMemoryBlock(LPVOID pOrigin)
 LPVOID AllocateBuffer(LPVOID pOrigin)
 {
     PMEMORY_SLOT  pSlot;
-    PMEMORY_BLOCK pBlock = GetMemoryBlock(pOrigin);
+    PMEMORY_BLOCK pBlock = GetMemoryBlockInRange(pOrigin, MAX_MEMORY_RANGE);
+#if defined(_M_X64) || defined(__x86_64__)
+    // Preserve the usual placement when possible; expand only on allocation failure.
+    if (pBlock == NULL)
+        pBlock = GetMemoryBlockInRange(pOrigin, FALLBACK_MEMORY_RANGE);
+#endif
     if (pBlock == NULL)
         return NULL;
 

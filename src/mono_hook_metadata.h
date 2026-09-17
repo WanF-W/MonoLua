@@ -17,7 +17,6 @@ namespace mono_hook_detail
         uint32_t id = 0;
         int luaRef = LUA_REFNIL;
         bool enabled = false;
-        void (*probeCallback)() = nullptr;
         void (*tickCallback)() = nullptr;
         bool isStatic = false;
         std::vector<MonoType*> parameters;

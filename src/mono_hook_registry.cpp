@@ -15,7 +15,6 @@ namespace mono_hook_detail
     std::vector<int> g_deferredLuaRefs;
     bool g_metadataCleanupPending = false;
     HookEntry* g_tickEntry = nullptr;
-    HookEntry* g_probeEntry = nullptr;
     // 调用方持有 g_mutex。若在创建可执行资源前发生 Lua 分配或普通设置失败，
     // 撤销容器登记。
     struct PendingRegistration
@@ -24,7 +23,7 @@ namespace mono_hook_detail
         ~PendingRegistration()
         {
             if (bridge_lifecycle::g_sessionFaulted.load() || entry->enabled || entry->luaRef != LUA_REFNIL ||
-                entry->probeCallback || entry->tickCallback)
+                entry->tickCallback)
                 return;
             if (entry->thunk)
             {
@@ -216,7 +215,7 @@ bool MonoHook::UnhookMethod(MonoMethod* method)
         HookEntry* entry = found->second;
         QueueLuaRefLocked(entry->luaRef);
         entry->luaRef = LUA_REFNIL;
-        if (!entry->tickCallback && !entry->probeCallback)
+        if (!entry->tickCallback)
         {
             const MH_STATUS disabled = SafeMinHookCall(MH_DisableHook, entry->target);
             if (disabled == MH_OK || disabled == MH_ERROR_DISABLED) entry->enabled = false;
@@ -235,7 +234,7 @@ bool MonoHook::IsHooked(MonoMethod* method)
     return found != g_methods.end() && found->second->enabled && found->second->luaRef != LUA_REFNIL;
 }
 
-static bool InstallInternalHook(MonoMethod* method, void (*callback)(), bool probe, std::string& error,
+static bool InstallInternalHook(MonoMethod* method, void (*callback)(), std::string& error,
                                 const MonoScheduler::Candidate* candidate = nullptr)
 {
     error.clear();
@@ -262,18 +261,17 @@ static bool InstallInternalHook(MonoMethod* method, void (*callback)(), bool pro
     }
 
     // 只有 Hook 启用成功后才提交选中的调度角色。
-    const auto commitRole = [callback, probe, &error](HookEntry* next) {
-        HookEntry*& current = probe ? g_probeEntry : g_tickEntry;
+    const auto commitRole = [callback, &error](HookEntry* next) {
+        HookEntry*& current = g_tickEntry;
         if (current && current != next)
         {
-            const bool hasOtherRole = probe ? current->tickCallback != nullptr : current->probeCallback != nullptr;
-            if (current->luaRef == LUA_REFNIL && !hasOtherRole)
+            if (current->luaRef == LUA_REFNIL)
             {
                 const MH_STATUS disabled = SafeMinHookCall(MH_DisableHook, current->target);
                 if (disabled != MH_OK && disabled != MH_ERROR_DISABLED)
                 {
                     error = std::string("failed to replace scheduler hook: ") + MH_StatusToString(disabled);
-                    if (next->luaRef == LUA_REFNIL && !next->tickCallback && !next->probeCallback)
+                    if (next->luaRef == LUA_REFNIL && !next->tickCallback)
                     {
                         const MH_STATUS rollback = SafeMinHookCall(MH_DisableHook, next->target);
                         if (rollback == MH_OK || rollback == MH_ERROR_DISABLED) next->enabled = false;
@@ -289,11 +287,9 @@ static bool InstallInternalHook(MonoMethod* method, void (*callback)(), bool pro
                 }
                 current->enabled = false;
             }
-            if (probe) current->probeCallback = nullptr;
-            else current->tickCallback = nullptr;
+            current->tickCallback = nullptr;
         }
-        if (probe) next->probeCallback = callback;
-        else next->tickCallback = callback;
+        next->tickCallback = callback;
         next->enabled = true;
         current = next;
         return true;
@@ -337,16 +333,16 @@ static bool InstallInternalHook(MonoMethod* method, void (*callback)(), bool pro
 
 bool MonoHook::InstallTick(MonoMethod* method, void (*callback)(), std::string& error)
 {
-    return InstallInternalHook(method, callback, false, error);
+    return InstallInternalHook(method, callback, error);
 }
 
 bool MonoHook::InstallSchedulerEntry(MonoMethod* method, const MonoScheduler::Candidate& candidate,
-                                     void (*callback)(), bool probe, std::string& error)
+                                     void (*callback)(), std::string& error)
 {
     // 调度器候选来自目标游戏的私有 Mono 构建。元数据由窄边界保护，
     // MinHook 也逐调用保护；这里不包住内部互斥锁，避免跳过锁析构。
     bridge_lifecycle::ClearNativeCallFault();
-    const bool success = InstallInternalHook(method, callback, probe, error, &candidate);
+    const bool success = InstallInternalHook(method, callback, error, &candidate);
     if (success) return true;
     if (ConsumeNativeCallFault("scheduler hook installation", error)) return false;
     if (error.empty()) error = "scheduler hook installation failed";
@@ -362,7 +358,7 @@ void MonoHook::UnhookAll()
             if (!entry || entry->luaRef == LUA_REFNIL) continue;
             QueueLuaRefLocked(entry->luaRef);
             entry->luaRef = LUA_REFNIL;
-            if (!entry->tickCallback && !entry->probeCallback)
+            if (!entry->tickCallback)
             {
                 const MH_STATUS disabled = SafeMinHookCall(MH_DisableHook, entry->target);
                 if (disabled == MH_OK || disabled == MH_ERROR_DISABLED) entry->enabled = false;
@@ -389,11 +385,9 @@ void MonoHook::InvalidateMetadata()
             entry->luaRef = LUA_REFNIL;
             if (disabled) entry->enabled = false;
             entry->tickCallback = nullptr;
-            entry->probeCallback = nullptr;
         }
         g_methods.clear();
         g_tickEntry = nullptr;
-        g_probeEntry = nullptr;
         g_metadataCleanupPending = true;
     }
     // 不能在仍有 Hook 回调时释放 trampoline 或 Lua 引用。若当前就在
@@ -440,7 +434,6 @@ void MonoHook::DrainDeferred()
         g_entries.clear();
         g_methods.clear();
         g_tickEntry = nullptr;
-        g_probeEntry = nullptr;
         g_metadataCleanupPending = false;
     }
     for (int reference : g_deferredLuaRefs)
@@ -514,7 +507,6 @@ bool MonoHook::Shutdown()
     g_entries.clear();
     g_methods.clear();
     g_tickEntry = nullptr;
-    g_probeEntry = nullptr;
     g_metadataCleanupPending = false;
     for (int reference : g_deferredLuaRefs)
         if (state) luaL_unref(state, LUA_REGISTRYINDEX, reference);

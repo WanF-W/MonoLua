@@ -481,19 +481,6 @@ namespace mono_hook_detail
                 auto* entry = g_entries[context->hookId].get();
                 if (entry && entry->enabled && entry != g_bypassEntry && !g_shutdown.load())
                 {
-                    if (entry->probeCallback && g_dispatchDepth == 1 &&
-                        bridge_lifecycle::g_managedCallDepth == 0 && !LuaEngine::Instance().IsFaulted())
-                    {
-                        // 该回调只做原子身份绑定，不获取 Lua 或 Hook 锁。
-                        entry->probeCallback();
-                        entry->probeCallback = nullptr;
-                        g_probeEntry = nullptr;
-                        if (!entry->tickCallback && entry->luaRef == LUA_REFNIL)
-                        {
-                            const MH_STATUS status = SafeMinHookCall(MH_DisableHook, entry->target);
-                            if (status == MH_OK || status == MH_ERROR_DISABLED) entry->enabled = false;
-                        }
-                    }
                     if (g_dispatchDepth == 1 && bridge_lifecycle::g_managedCallDepth == 0)
                         tick = entry->tickCallback;
                     returnType = entry->returnType;
